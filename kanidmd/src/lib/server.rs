@@ -4,7 +4,8 @@
 // This is really only used for long lived, high level types that need clone
 // that otherwise can't be cloned. Think Mutex.
 use async_std::task;
-use concread::arcache::{ARCache, ARCacheReadTxn};
+use concread::arcache::{ARCache, ARCacheBuilder, ARCacheReadTxn};
+use concread::cowcell::*;
 use hashbrown::{HashMap, HashSet};
 use std::cell::Cell;
 use std::sync::Arc;
@@ -52,10 +53,16 @@ lazy_static! {
     static ref PVACP_ENABLE_FALSE: PartialValue = PartialValue::new_bool(false);
 }
 
+#[derive(Debug, Clone)]
+struct DomainInfo {
+    d_uuid: Uuid,
+    d_name: String,
+}
+
 #[derive(Clone)]
 pub struct QueryServer {
     s_uuid: Uuid,
-    d_uuid: Uuid,
+    d_info: Arc<CowCell<DomainInfo>>,
     be: Backend,
     schema: Arc<Schema>,
     accesscontrols: Arc<AccessControls>,
@@ -69,6 +76,7 @@ pub struct QueryServerReadTransaction<'a> {
     be_txn: BackendReadTransaction<'a>,
     // Anything else? In the future, we'll need to have a schema transaction
     // type, maybe others?
+    d_info: CowCellReadTxn<DomainInfo>,
     schema: SchemaReadTransaction,
     accesscontrols: AccessControlsReadTransaction<'a>,
     _db_ticket: SemaphorePermit<'a>,
@@ -78,7 +86,7 @@ pub struct QueryServerReadTransaction<'a> {
 
 pub struct QueryServerWriteTransaction<'a> {
     committed: bool,
-    d_uuid: Uuid,
+    d_info: CowCellWriteTxn<'a, DomainInfo>,
     cid: Cid,
     be_txn: BackendWriteTransaction<'a>,
     schema: SchemaWriteTransaction<'a>,
@@ -126,12 +134,15 @@ pub trait QueryServerTransaction<'a> {
     type AccessControlsTransactionType: AccessControlsTransaction<'a>;
     fn get_accesscontrols(&self) -> &Self::AccessControlsTransactionType;
 
+    fn get_domain_uuid(&self) -> Uuid;
+
+    fn get_domain_name(&self) -> &str;
+
     #[allow(clippy::mut_from_ref)]
     fn get_resolve_filter_cache(
         &self,
     ) -> &mut ARCacheReadTxn<'a, (IdentityId, Filter<FilterValid>), Filter<FilterValidResolved>>;
 
-    // ! TRACING INTEGRATED
     /// Conduct a search and apply access controls to yield a set of entries that
     /// have been reduced to the set of user visible avas. Note that if you provide
     /// a `SearchEvent` for the internal user, this query will fail. It is invalid for
@@ -165,7 +176,6 @@ pub trait QueryServerTransaction<'a> {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn search(&self, se: &SearchEvent) -> Result<Vec<Arc<EntrySealedCommitted>>, OperationError> {
         spanned!("server::search", {
             if se.ident.is_internal() {
@@ -222,7 +232,6 @@ pub trait QueryServerTransaction<'a> {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn exists(&self, ee: &ExistsEvent) -> Result<bool, OperationError> {
         spanned!("server::exists", {
             let be_txn = self.get_be_txn();
@@ -247,7 +256,6 @@ pub trait QueryServerTransaction<'a> {
         })
     }
 
-    // ! TRACING INTEGRATED
     // Should this actually be names_to_uuids and we do batches?
     //  In the initial design "no", we can always write a batched
     //  interface later.
@@ -264,7 +272,6 @@ pub trait QueryServerTransaction<'a> {
     //
     // Remember, we don't care if the name is invalid, because search
     // will validate/normalise the filter we construct for us. COOL!
-    // ! TRACING INTEGRATED
     fn name_to_uuid(&self, name: &str) -> Result<Uuid, OperationError> {
         // Is it just a uuid?
         Uuid::parse_str(name).or_else(|_| {
@@ -275,7 +282,6 @@ pub trait QueryServerTransaction<'a> {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn uuid_to_spn(&self, uuid: &Uuid) -> Result<Option<Value>, OperationError> {
         let r = self.get_be_txn().uuid2spn(uuid)?;
 
@@ -288,7 +294,6 @@ pub trait QueryServerTransaction<'a> {
         Ok(r)
     }
 
-    // ! TRACING INTEGRATED
     fn uuid_to_rdn(&self, uuid: &Uuid) -> Result<String, OperationError> {
         // If we have a some, pass it on, else unwrap into a default.
         self.get_be_txn()
@@ -296,7 +301,6 @@ pub trait QueryServerTransaction<'a> {
             .map(|v| v.unwrap_or_else(|| format!("uuid={}", uuid.to_hyphenated_ref())))
     }
 
-    // ! TRACING INTEGRATED
     // From internal, generate an exists event and dispatch
     fn internal_exists(&self, filter: Filter<FilterInvalid>) -> Result<bool, OperationError> {
         spanned!("server::internal_exists", {
@@ -311,7 +315,6 @@ pub trait QueryServerTransaction<'a> {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn internal_search(
         &self,
         filter: Filter<FilterInvalid>,
@@ -325,7 +328,6 @@ pub trait QueryServerTransaction<'a> {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn impersonate_search_valid(
         &self,
         f_valid: Filter<FilterValid>,
@@ -338,7 +340,6 @@ pub trait QueryServerTransaction<'a> {
         })
     }
 
-    // ! TRACING INTEGRATED
     // this applys ACP to filter result entries.
     fn impersonate_search_ext_valid(
         &self,
@@ -350,7 +351,6 @@ pub trait QueryServerTransaction<'a> {
         self.search_ext(&se)
     }
 
-    // ! TRACING INTEGRATED
     // Who they are will go here
     fn impersonate_search(
         &self,
@@ -367,7 +367,6 @@ pub trait QueryServerTransaction<'a> {
         self.impersonate_search_valid(f_valid, f_intent_valid, event)
     }
 
-    // ! TRACING INTEGRATED
     fn impersonate_search_ext(
         &self,
         filter: Filter<FilterInvalid>,
@@ -385,7 +384,6 @@ pub trait QueryServerTransaction<'a> {
         })
     }
 
-    // ! TRACING INTEGRATED
     // Get a single entry by it's UUID. This is heavily relied on for internal
     // server operations, especially in login and acp checks for acp.
     fn internal_search_uuid(
@@ -409,7 +407,6 @@ pub trait QueryServerTransaction<'a> {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn impersonate_search_ext_uuid(
         &self,
         uuid: &Uuid,
@@ -427,7 +424,6 @@ pub trait QueryServerTransaction<'a> {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn impersonate_search_uuid(
         &self,
         uuid: &Uuid,
@@ -445,7 +441,6 @@ pub trait QueryServerTransaction<'a> {
         })
     }
 
-    // ! TRACING INTEGRATED
     /// Do a schema aware conversion from a String:String to String:Value for modification
     /// present.
     fn clone_value(&self, attr: &str, value: &str) -> Result<Value, OperationError> {
@@ -480,7 +475,7 @@ pub trait QueryServerTransaction<'a> {
                                 // all subsequent filter tests because it ... well, doesn't exist.
                                 let un = self
                                     .name_to_uuid( value)
-                                    .unwrap_or_else(|_| UUID_DOES_NOT_EXIST);
+                                    .unwrap_or(UUID_DOES_NOT_EXIST);
                                 Some(Value::new_uuid(un))
                             })
                             // I think this is unreachable due to how the .or_else works.
@@ -492,7 +487,7 @@ pub trait QueryServerTransaction<'a> {
                             .or_else(|| {
                                 let un = self
                                     .name_to_uuid( value)
-                                    .unwrap_or_else(|_| UUID_DOES_NOT_EXIST);
+                                    .unwrap_or(UUID_DOES_NOT_EXIST);
                                 Some(Value::new_refer(un))
                             })
                             // I think this is unreachable due to how the .or_else works.
@@ -507,14 +502,18 @@ pub trait QueryServerTransaction<'a> {
                     SyntaxType::UINT32 => Value::new_uint32_str(value)
                         .ok_or_else(|| OperationError::InvalidAttribute("Invalid uint32 syntax".to_string())),
                     SyntaxType::Cid => Err(OperationError::InvalidAttribute("CIDs are generated and not able to be set.".to_string())),
-                    SyntaxType::NsUniqueId => Ok(Value::new_nsuniqueid_s(value)),
+                    SyntaxType::NsUniqueId => Value::new_nsuniqueid_s(value)
+                        .ok_or_else(|| OperationError::InvalidAttribute("Invalid NsUniqueId syntax".to_string())),
                     SyntaxType::DateTime => Value::new_datetime_s(value)
                         .ok_or_else(|| OperationError::InvalidAttribute("Invalid DateTime (rfc3339) syntax".to_string())),
-                    SyntaxType::EmailAddress => Ok(Value::new_email_address_s(value)),
+                    SyntaxType::EmailAddress => Value::new_email_address_s(value)
+                        .ok_or_else(|| OperationError::InvalidAttribute("Invalid Email Address syntax".to_string())),
                     SyntaxType::Url => Value::new_url_s(value)
                         .ok_or_else(|| OperationError::InvalidAttribute("Invalid Url (whatwg/url) syntax".to_string())),
-                    SyntaxType::OauthScope => Ok(Value::new_oauthscope(value)),
+                    SyntaxType::OauthScope => Value::new_oauthscope(value)
+                        .ok_or_else(|| OperationError::InvalidAttribute("Invalid Oauth Scope syntax".to_string())),
                     SyntaxType::OauthScopeMap => Err(OperationError::InvalidAttribute("Oauth Scope Maps can not be supplied through modification - please use the IDM api".to_string())),
+                    SyntaxType::PrivateBinary => Err(OperationError::InvalidAttribute("Private Binary Values can not be supplied through modification".to_string())),
                 }
             }
             None => {
@@ -525,7 +524,6 @@ pub trait QueryServerTransaction<'a> {
         }
     }
 
-    // ! TRACING INTEGRATED
     fn clone_partialvalue(&self, attr: &str, value: &str) -> Result<PartialValue, OperationError> {
         let schema = self.get_schema();
 
@@ -552,9 +550,7 @@ pub trait QueryServerTransaction<'a> {
                                 // if the value is NOT found, we map to "does not exist" to allow
                                 // the value to continue being evaluated, which of course, will fail
                                 // all subsequent filter tests because it ... well, doesn't exist.
-                                let un = self
-                                    .name_to_uuid(value)
-                                    .unwrap_or_else(|_| UUID_DOES_NOT_EXIST);
+                                let un = self.name_to_uuid(value).unwrap_or(UUID_DOES_NOT_EXIST);
                                 Some(PartialValue::new_uuid(un))
                             })
                             // I think this is unreachable due to how the .or_else works.
@@ -578,9 +574,7 @@ pub trait QueryServerTransaction<'a> {
                         // See comments above.
                         PartialValue::new_refer_s(value)
                             .or_else(|| {
-                                let un = self
-                                    .name_to_uuid(value)
-                                    .unwrap_or_else(|_| UUID_DOES_NOT_EXIST);
+                                let un = self.name_to_uuid(value).unwrap_or(UUID_DOES_NOT_EXIST);
                                 Some(PartialValue::new_refer(un))
                             })
                             // I think this is unreachable due to how the .or_else works.
@@ -595,9 +589,7 @@ pub trait QueryServerTransaction<'a> {
                         // See comments above.
                         PartialValue::new_oauthscopemap_s(value)
                             .or_else(|| {
-                                let un = self
-                                    .name_to_uuid(value)
-                                    .unwrap_or_else(|_| UUID_DOES_NOT_EXIST);
+                                let un = self.name_to_uuid(value).unwrap_or(UUID_DOES_NOT_EXIST);
                                 Some(PartialValue::new_oauthscopemap(un))
                             })
                             // I think this is unreachable due to how the .or_else works.
@@ -641,6 +633,7 @@ pub trait QueryServerTransaction<'a> {
                         )
                     }),
                     SyntaxType::OauthScope => Ok(PartialValue::new_oauthscope(value)),
+                    SyntaxType::PrivateBinary => Ok(PartialValue::PrivateBinary),
                 }
             }
             None => {
@@ -707,9 +700,7 @@ pub trait QueryServerTransaction<'a> {
         }
     }
 
-    // This is a prebaked helper to get the domain name for related modules.
-    // in the future we could make this cache the value to avoid entry lookups.
-    fn get_domain_name(&self) -> Result<String, OperationError> {
+    fn get_db_domain_name(&self) -> Result<String, OperationError> {
         self.internal_search_uuid(&UUID_DOMAIN_INFO)
             .and_then(|e| {
                 e.get_ava_single_str("domain_name")
@@ -722,20 +713,32 @@ pub trait QueryServerTransaction<'a> {
             })
     }
 
-    fn get_domain_token_key(&self) -> Result<String, OperationError> {
+    fn get_domain_fernet_private_key(&self) -> Result<String, OperationError> {
         self.internal_search_uuid(&UUID_DOMAIN_INFO)
             .and_then(|e| {
-                e.get_ava_single_secret("domain_token_key")
+                e.get_ava_single_secret("fernet_private_key_str")
                     .map(str::to_string)
                     .ok_or(OperationError::InvalidEntryState)
             })
             .map_err(|e| {
-                admin_error!(?e, "Error getting domain token key");
+                admin_error!(?e, "Error getting domain fernet key");
                 e
             })
     }
 
-    // ! TRACING INTEGRATED
+    fn get_domain_es256_private_key(&self) -> Result<Vec<u8>, OperationError> {
+        self.internal_search_uuid(&UUID_DOMAIN_INFO)
+            .and_then(|e| {
+                e.get_ava_single_private_binary("es256_private_key_der")
+                    .map(|s| s.to_vec())
+                    .ok_or(OperationError::InvalidEntryState)
+            })
+            .map_err(|e| {
+                admin_error!(?e, "Error getting domain es256 key");
+                e
+            })
+    }
+
     // This is a helper to get password badlist.
     fn get_password_badlist(&self) -> Result<HashSet<String>, OperationError> {
         self.internal_search_uuid(&UUID_SYSTEM_CONFIG)
@@ -752,7 +755,6 @@ pub trait QueryServerTransaction<'a> {
             })
     }
 
-    // ! TRACING INTEGRATED
     fn get_oauth2rs_set(&self) -> Result<Vec<Arc<EntrySealedCommitted>>, OperationError> {
         self.internal_search(filter!(f_eq(
             "class",
@@ -796,6 +798,14 @@ impl<'a> QueryServerTransaction<'a> for QueryServerReadTransaction<'a> {
                     Filter<FilterValidResolved>,
                 >
         }
+    }
+
+    fn get_domain_uuid(&self) -> Uuid {
+        self.d_info.d_uuid
+    }
+
+    fn get_domain_name(&self) -> &str {
+        &self.d_info.d_name
     }
 }
 
@@ -870,15 +880,18 @@ impl<'a> QueryServerTransaction<'a> for QueryServerWriteTransaction<'a> {
                 >
         }
     }
-}
 
-#[derive(Clone, Debug)]
-struct QueryServerMeta {
-    pub max_cid: Cid,
+    fn get_domain_uuid(&self) -> Uuid {
+        self.d_info.d_uuid
+    }
+
+    fn get_domain_name(&self) -> &str {
+        &self.d_info.d_name
+    }
 }
 
 impl QueryServer {
-    pub fn new(be: Backend, schema: Schema) -> Self {
+    pub fn new(be: Backend, schema: Schema, d_name: String) -> Self {
         let (s_uuid, d_uuid) = {
             let wr = be.write();
             let res = (wr.get_db_s_uuid(), wr.get_db_d_uuid());
@@ -890,27 +903,40 @@ impl QueryServer {
 
         let pool_size = be.get_pool_size();
 
-        info!("Server ID -> {:?}", s_uuid);
-        info!("Domain ID -> {:?}", d_uuid);
+        info!("Server UUID -> {:?}", s_uuid);
+        info!("Domain UUID -> {:?}", d_uuid);
+        info!("Domain Name -> {:?}", d_name);
+
+        let d_info = Arc::new(CowCell::new(DomainInfo { d_uuid, d_name }));
+
         // log_event!(log, "Starting query worker ...");
         QueryServer {
             s_uuid,
-            d_uuid,
+            d_info,
             be,
             schema: Arc::new(schema),
             accesscontrols: Arc::new(AccessControls::new()),
             db_tickets: Arc::new(Semaphore::new(pool_size as usize)),
             write_ticket: Arc::new(Semaphore::new(1)),
-            resolve_filter_cache: Arc::new(ARCache::new_size(
-                RESOLVE_FILTER_CACHE_MAX,
-                RESOLVE_FILTER_CACHE_LOCAL,
-            )),
+            resolve_filter_cache: Arc::new(
+                ARCacheBuilder::new()
+                    .set_size(RESOLVE_FILTER_CACHE_MAX, RESOLVE_FILTER_CACHE_LOCAL)
+                    .set_reader_quiesce(true)
+                    .build()
+                    .expect("Failer to build resolve_filter_cache"),
+            ),
         }
     }
 
     #[cfg(test)]
     pub fn read(&self) -> QueryServerReadTransaction {
         task::block_on(self.read_async())
+    }
+
+    pub fn try_quiesce(&self) {
+        self.be.try_quiesce();
+        self.accesscontrols.try_quiesce();
+        self.resolve_filter_cache.try_quiesce();
     }
 
     pub async fn read_async(&self) -> QueryServerReadTransaction<'_> {
@@ -925,6 +951,7 @@ impl QueryServer {
         QueryServerReadTransaction {
             be_txn: self.be.read(),
             schema: self.schema.read(),
+            d_info: self.d_info.read(),
             accesscontrols: self.accesscontrols.read(),
             _db_ticket: db_ticket,
             resolve_filter_cache: Cell::new(self.resolve_filter_cache.read()),
@@ -956,10 +983,11 @@ impl QueryServer {
         // let schema_write = self.schema.write().await;
         let schema_write = self.schema.write();
         let be_txn = self.be.write();
+        let d_info = self.d_info.write();
 
         #[allow(clippy::expect_used)]
         let ts_max = be_txn.get_db_ts_max(&ts).expect("Unable to get db_ts_max");
-        let cid = Cid::new_lamport(self.s_uuid, self.d_uuid, ts, &ts_max);
+        let cid = Cid::new_lamport(self.s_uuid, d_info.d_uuid, ts, &ts_max);
 
         QueryServerWriteTransaction {
             // I think this is *not* needed, because commit is mut self which should
@@ -969,7 +997,7 @@ impl QueryServer {
             // The commited flag is however used for abort-specific code in drop
             // which today I don't think we have ... yet.
             committed: false,
-            d_uuid: self.d_uuid,
+            d_info,
             cid,
             be_txn,
             schema: schema_write,
@@ -985,7 +1013,7 @@ impl QueryServer {
         }
     }
 
-    pub(crate) fn initialise_helper(&self, ts: Duration) -> Result<(), OperationError> {
+    pub fn initialise_helper(&self, ts: Duration) -> Result<(), OperationError> {
         // First, check our database version - attempt to do an initial indexing
         // based on the in memory configuration
         //
@@ -1061,6 +1089,14 @@ impl QueryServer {
             migrate_txn.migrate_3_to_4()?;
         }
 
+        if system_info_version < 5 {
+            migrate_txn.migrate_4_to_5()?;
+        }
+
+        if system_info_version < 6 {
+            migrate_txn.migrate_5_to_6()?;
+        }
+
         migrate_txn.commit()?;
         // Migrations complete. Init idm will now set the version as needed.
 
@@ -1069,7 +1105,7 @@ impl QueryServer {
             .initialise_idm()
             .and_then(|_| ts_write_3.commit())?;
 
-        admin_info!("ready to rock! 🪨  ");
+        admin_info!("migrations success! ☀️  ");
         Ok(())
     }
 
@@ -1938,6 +1974,33 @@ impl<'a> QueryServerWriteTransaction<'a> {
         })
     }
 
+    /// Migrate 4 to 5 - this triggers a regen of all oauth2 RS es256 der keys
+    /// as we previously did not generate them on entry creation.
+    pub fn migrate_4_to_5(&self) -> Result<(), OperationError> {
+        spanned!("server::migrate_4_to_5", {
+            admin_warn!("starting 4 to 5 migration.");
+            let filter = filter!(f_and!([
+                f_eq("class", (*PVCLASS_OAUTH2_RS).clone()),
+                f_andnot(f_pres("es256_private_key_der")),
+            ]));
+            let modlist = ModifyList::new_purge("es256_private_key_der");
+            self.internal_modify(&filter, &modlist)
+            // Complete
+        })
+    }
+
+    /// Migrate 5 to 6 - This updates the domain info item to reset the token
+    /// keys based on the new encryption types.
+    pub fn migrate_5_to_6(&self) -> Result<(), OperationError> {
+        spanned!("server::migrate_5_to_6", {
+            admin_warn!("starting 5 to 6 migration.");
+            let filter = filter!(f_eq("uuid", (*PVUUID_DOMAIN_INFO).clone()));
+            let modlist = ModifyList::new_purge("domain_token_key");
+            self.internal_modify(&filter, &modlist)
+            // Complete
+        })
+    }
+
     // These are where searches and other actions are actually implemented. This
     // is the "internal" version, where we define the event as being internal
     // only, allowing certain plugin by passes etc.
@@ -2083,7 +2146,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
         //
         // NOTE: gen modlist IS schema aware and will handle multivalue
         // correctly!
-        admin_info!("internal_migrate_or_create operating on {:?}", e.get_uuid());
+        trace!("internal_migrate_or_create operating on {:?}", e.get_uuid());
 
         let filt = match e.filter_from_attrs(&[AttrString::from("uuid")]) {
             Some(f) => f,
@@ -2215,6 +2278,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
             JSON_SCHEMA_ATTR_DOMAIN_UUID,
             JSON_SCHEMA_ATTR_DOMAIN_SSID,
             JSON_SCHEMA_ATTR_DOMAIN_TOKEN_KEY,
+            JSON_SCHEMA_ATTR_FERNET_PRIVATE_KEY_STR,
             JSON_SCHEMA_ATTR_GIDNUMBER,
             JSON_SCHEMA_ATTR_BADLIST_PASSWORD,
             JSON_SCHEMA_ATTR_LOGINSHELL,
@@ -2227,7 +2291,12 @@ impl<'a> QueryServerWriteTransaction<'a> {
             JSON_SCHEMA_ATTR_OAUTH2_RS_IMPLICIT_SCOPES,
             JSON_SCHEMA_ATTR_OAUTH2_RS_BASIC_SECRET,
             JSON_SCHEMA_ATTR_OAUTH2_RS_TOKEN_KEY,
+            JSON_SCHEMA_ATTR_ES256_PRIVATE_KEY_DER,
+            JSON_SCHEMA_ATTR_OAUTH2_ALLOW_INSECURE_CLIENT_DISABLE_PKCE,
+            JSON_SCHEMA_ATTR_OAUTH2_JWT_LEGACY_CRYPTO_ENABLE,
+            JSON_SCHEMA_ATTR_RS256_PRIVATE_KEY_DER,
             JSON_SCHEMA_CLASS_PERSON,
+            JSON_SCHEMA_CLASS_ORGPERSON,
             JSON_SCHEMA_CLASS_GROUP,
             JSON_SCHEMA_CLASS_ACCOUNT,
             JSON_SCHEMA_CLASS_DOMAIN_INFO,
@@ -2267,9 +2336,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
             admin_error!("initialise_idm p1 -> result {:?}", res);
         }
         debug_assert!(res.is_ok());
-        if res.is_err() {
-            return res;
-        }
+        let _ = res?;
 
         // The domain info now exists, we should be able to do these migrations as they will
         // cause SPN regenerations to occur
@@ -2291,9 +2358,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
             admin_error!("initialise_idm p2 -> result {:?}", res);
         }
         debug_assert!(res.is_ok());
-        if res.is_err() {
-            return res;
-        }
+        let _ = res?;
 
         // Create any system default schema entries.
 
@@ -2305,6 +2370,9 @@ impl<'a> QueryServerWriteTransaction<'a> {
             JSON_IDM_PEOPLE_EXTEND_PRIV_V1,
             JSON_IDM_PEOPLE_WRITE_PRIV_V1,
             JSON_IDM_PEOPLE_READ_PRIV_V1,
+            JSON_IDM_HP_PEOPLE_EXTEND_PRIV_V1,
+            JSON_IDM_HP_PEOPLE_WRITE_PRIV_V1,
+            JSON_IDM_HP_PEOPLE_READ_PRIV_V1,
             JSON_IDM_GROUP_MANAGE_PRIV_V1,
             JSON_IDM_GROUP_WRITE_PRIV_V1,
             JSON_IDM_GROUP_UNIX_EXTEND_PRIV_V1,
@@ -2312,6 +2380,8 @@ impl<'a> QueryServerWriteTransaction<'a> {
             JSON_IDM_ACCOUNT_WRITE_PRIV_V1,
             JSON_IDM_ACCOUNT_UNIX_EXTEND_PRIV_V1,
             JSON_IDM_ACCOUNT_READ_PRIV_V1,
+            JSON_IDM_RADIUS_SECRET_WRITE_PRIV_V1,
+            JSON_IDM_RADIUS_SECRET_READ_PRIV_V1,
             JSON_IDM_RADIUS_SERVERS_V1,
             // Write deps on read, so write must be added first.
             JSON_IDM_HP_ACCOUNT_MANAGE_PRIV_V1,
@@ -2357,9 +2427,14 @@ impl<'a> QueryServerWriteTransaction<'a> {
             JSON_IDM_ACP_GROUP_UNIX_EXTEND_PRIV_V1,
             JSON_IDM_ACP_PEOPLE_ACCOUNT_PASSWORD_IMPORT_PRIV_V1,
             JSON_IDM_ACP_PEOPLE_EXTEND_PRIV_V1,
+            JSON_IDM_ACP_HP_PEOPLE_READ_PRIV_V1,
+            JSON_IDM_ACP_HP_PEOPLE_WRITE_PRIV_V1,
+            JSON_IDM_ACP_HP_PEOPLE_EXTEND_PRIV_V1,
             JSON_IDM_HP_ACP_ACCOUNT_UNIX_EXTEND_PRIV_V1,
             JSON_IDM_HP_ACP_GROUP_UNIX_EXTEND_PRIV_V1,
             JSON_IDM_HP_ACP_OAUTH2_MANAGE_PRIV_V1,
+            JSON_IDM_ACP_RADIUS_SECRET_READ_PRIV_V1,
+            JSON_IDM_ACP_RADIUS_SECRET_WRITE_PRIV_V1,
         ];
 
         let res: Result<(), _> = idm_entries
@@ -2371,9 +2446,7 @@ impl<'a> QueryServerWriteTransaction<'a> {
             admin_error!(?res, "initialise_idm p3 -> result");
         }
         debug_assert!(res.is_ok());
-        if res.is_err() {
-            return res;
-        }
+        let _ = res?;
 
         self.changed_schema.set(true);
         self.changed_acp.set(true);
@@ -2567,13 +2640,43 @@ impl<'a> QueryServerWriteTransaction<'a> {
         })
     }
 
-    pub(crate) fn get_domain_uuid(&self) -> Uuid {
-        self.d_uuid
+    fn reload_domain_info(&mut self) -> Result<(), OperationError> {
+        let domain_name = self.get_db_domain_name()?;
+
+        let mut_d_info = self.d_info.get_mut();
+        if mut_d_info.d_name != domain_name {
+            admin_warn!(
+                "Using database configured domain name {} - was {}",
+                domain_name,
+                mut_d_info.d_name,
+            );
+            admin_warn!(
+                "If you think this is an error, see https://kanidm.github.io/kanidm/administrivia.html#rename-the-domain"
+            );
+            mut_d_info.d_name = domain_name;
+        }
+        Ok(())
     }
 
     /// Initiate a domain rename process. This is generally an internal function but it's
     /// exposed to the cli for admins to be able to initiate the process.
-    pub fn domain_rename(&self, new_domain_name: &str) -> Result<(), OperationError> {
+    pub fn domain_rename(&self) -> Result<(), OperationError> {
+        unsafe { self.domain_rename_inner(self.d_info.d_name.as_str()) }
+    }
+
+    /// # Safety
+    /// This is UNSAFE because while it may change the domain name, it doesn't update
+    /// the running configured version of the domain name that is resident to the
+    /// query server.
+    ///
+    /// Currently it's only used to test what happens if we rename the domain and how
+    /// that impacts spns, but in the future we may need to reconsider how this is
+    /// approached, especially if we have a domain re-name replicated to us. It could
+    /// be that we end up needing to have this as a cow cell or similar?
+    pub(crate) unsafe fn domain_rename_inner(
+        &self,
+        new_domain_name: &str,
+    ) -> Result<(), OperationError> {
         let modl = ModifyList::new_purge_and_set("domain_name", Value::new_iname(new_domain_name));
         let udi = PartialValue::new_uuidr(&UUID_DOMAIN_INFO);
         let filt = filter_all!(f_eq("uuid", udi));
@@ -2628,11 +2731,16 @@ impl<'a> QueryServerWriteTransaction<'a> {
             //    .invalidate_related_cache(self.changed_uuid.into_inner().as_slice())
         }
 
+        if self.changed_domain.get() {
+            self.reload_domain_info()?;
+        }
+
         // Now destructure the transaction ready to reset it.
         let QueryServerWriteTransaction {
             committed,
             be_txn,
             schema,
+            d_info,
             accesscontrols,
             cid,
             ..
@@ -2650,7 +2758,9 @@ impl<'a> QueryServerWriteTransaction<'a> {
             // because both are consistent.
             schema
                 .commit()
-                .and_then(|_| accesscontrols.commit().and_then(|_| be_txn.commit()))
+                .map(|_| d_info.commit())
+                .and_then(|_| accesscontrols.commit())
+                .and_then(|_| be_txn.commit())
         } else {
             Err(OperationError::ConsistencyError(r))
         }
@@ -2665,7 +2775,6 @@ mod tests {
     use crate::credential::policy::CryptoPolicy;
     use crate::credential::Credential;
     use crate::event::{CreateEvent, DeleteEvent, ModifyEvent, ReviveRecycledEvent, SearchEvent};
-    use crate::modify::{Modify, ModifyList};
     use crate::prelude::*;
     use kanidm_proto::v1::SchemaError;
     use std::sync::Arc;

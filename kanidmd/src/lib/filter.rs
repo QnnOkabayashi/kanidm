@@ -17,8 +17,9 @@ use crate::value::{IndexType, PartialValue};
 use concread::arcache::ARCacheReadTxn;
 use kanidm_proto::v1::Filter as ProtoFilter;
 use kanidm_proto::v1::{OperationError, SchemaError};
-use ldap3_server::proto::{LdapFilter, LdapSubstringFilter};
+use ldap3_proto::proto::{LdapFilter, LdapSubstringFilter};
 // use smartstring::alias::String as AttrString;
+use serde::Deserialize;
 use std::cmp::{Ordering, PartialOrd};
 use std::collections::BTreeSet;
 use std::hash::Hash;
@@ -485,7 +486,6 @@ impl Filter<FilterInvalid> {
     // This has to have two versions to account for ro/rw traits, because RS can't
     // monomorphise on the trait to call clone_value. An option is to make a fn that
     // takes "clone_value(t, a, v) instead, but that may have a similar issue.
-    // ! TRACING INTEGRATED
     pub fn from_ro(
         ev: &Identity,
         f: &ProtoFilter,
@@ -721,7 +721,6 @@ impl FilterComp {
         }
     }
 
-    // ! TRACING INTEGRATED
     fn from_ro(
         f: &ProtoFilter,
         qs: &QueryServerReadTransaction,
@@ -1333,7 +1332,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use kanidm_proto::v1::Filter as ProtoFilter;
-    use ldap3_server::simple::LdapFilter;
+    use ldap3_proto::simple::LdapFilter;
 
     #[test]
     fn test_filter_simple() {
@@ -1374,13 +1373,7 @@ mod tests {
 
     #[test]
     fn test_filter_optimise() {
-        use env_logger;
-        ::std::env::set_var("RUST_LOG", "actix_web=debug,kanidm=debug");
-        let _ = env_logger::builder()
-            .format_timestamp(None)
-            .format_level(false)
-            .is_test(true)
-            .try_init();
+        let _ = tracing_subscriber::fmt().try_init();
         // Given sets of "optimisable" filters, optimise them.
         filter_optimise_assert!(
             f_and(vec![f_and(vec![f_eq(

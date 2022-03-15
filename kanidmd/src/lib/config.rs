@@ -5,6 +5,7 @@
 //! or domain entries that are able to be replicated.
 
 use rand::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
@@ -89,6 +90,7 @@ pub struct Configuration {
     pub integration_test_config: Option<Box<IntegrationTestConfig>>,
     pub log_level: Option<u32>,
     pub online_backup: Option<OnlineBackup>,
+    pub domain: String,
     pub origin: String,
     pub role: ServerRole,
 }
@@ -133,7 +135,12 @@ impl Configuration {
         let mut c = Configuration {
             address: String::from("127.0.0.1:8080"),
             ldapaddress: None,
-            threads: num_cpus::get(),
+            threads: std::thread::available_parallelism()
+                .map(|t| t.get())
+                .unwrap_or_else(|_e| {
+                    eprintln!("WARNING: Unable to read number of available CPUs, defaulting to 1");
+                    1
+                }),
             db_path: String::from(""),
             db_fs_type: None,
             db_arc_size: None,
@@ -147,6 +154,7 @@ impl Configuration {
             integration_test_config: None,
             log_level: None,
             online_backup: None,
+            domain: "idm.example.com".to_string(),
             origin: "https://idm.example.com".to_string(),
             role: ServerRole::WriteReplica,
         };
@@ -200,6 +208,10 @@ impl Configuration {
 
     pub fn update_origin(&mut self, o: &str) {
         self.origin = o.to_string();
+    }
+
+    pub fn update_domain(&mut self, d: &str) {
+        self.domain = d.to_string();
     }
 
     pub fn update_role(&mut self, r: ServerRole) {

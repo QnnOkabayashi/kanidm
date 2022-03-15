@@ -47,25 +47,38 @@ decisions to Kanidm.
 
 It's important for you to know *how* your resource server supports oauth2. For example, does it
 support rfc7662 token introspection or does it rely on openid connect for identity information?
-Does the resource server support PKCE S256 or not?
+Does the resource server support PKCE S256?
 
 In general Kanidm requires that your resource server supports:
 
 * HTTP basic authentication to the authorisation server
 * PKCE S256 code verification to prevent certain token attack classes
+* OIDC only - JWT ES256 for token signatures
 
-Kanidm will expose it's oauth2 apis at the urls:
+Kanidm will expose it's oauth2 apis at the following urls:
 
-* auth url: https://idm.example.com/ui/oauth2
+* user auth url: https://idm.example.com/ui/oauth2
+* api auth url: https://idm.example.com/oauth2/authorise
 * token url: https://idm.example.com/oauth2/token
 * token inspect url: https://idm.example.com/oauth2/inspect
+
+OpenID Connect discovery - you need to substitute your oauth2 client id in the following
+urls:
+
+* openid connect issuer uri: https://idm.example.com/oauth2/openid/:client\_id:/
+* openid connect discovery:  https://idm.example.com/oauth2/openid/:client\_id:/.well-known/openid-configuration
+
+For manual OpenID configuration:
+
+* openid connect userinfo:   https://idm.example.com/oauth2/openid/:client\_id:/userinfo
+* token signing public key:  https://idm.example.com/oauth2/openid/:client\_id:/public\_key.jwk
 
 ### Scope Relationships
 
 For an authorisation to proceed, the resource server will request a list of scopes, which are
 unique to that resource server. For example, when a user wishes to login to the admin panel
 of the resource server, it may request the "admin" scope from kanidm for authorisation. But when
-a user wants to login, it may only request "acces" as a scope from kanidm.
+a user wants to login, it may only request "access" as a scope from kanidm.
 
 As each resource server may have it's own scopes and understanding of these, Kanidm isolates
 scopes to each resource server connected to Kanidm. Kanidm has two methods of granting scopes to accounts (users).
@@ -79,6 +92,10 @@ server, and the groups/roles in Kanidm which can be specific to that resource se
 For an authorisation to proceed, all scopes requested must be available in the final scope set
 that is granted to the account. This final scope set can be built from implicit and mapped
 scopes.
+
+This use of scopes is the primary means to control who can access what resources. For example, if
+you have a resource server that will always request a scope of "read", then you can limit the
+"read" scope to a single group of users by a scope map so that only they may access that resource.
 
 ## Configuration
 
@@ -102,6 +119,22 @@ You can create a scope map with:
 
     kanidm system oauth2 create_scope_map <name> <kanidm_group_name> [scopes]...
     kanidm system oauth2 create_scope_map nextcloud nextcloud_admins admin
+
+> **WARNING**
+> If you are creating an openid connect (OIDC) resource server you *MUST* provide a
+> scope map OR implicit scope named 'openid'. Without this, openid clients *WILL NOT WORK*
+
+> **HINT**
+> openid connect allows a number of scopes that affect the content of the resulting
+> authorisation token. If one of the following scopes are requested by the openid client,
+> then the associated claims may be added to the authorisation token. It is not guaranteed
+> that all of the associated claims will be added.
+>
+> * profile - (name, family\_name, given\_name, middle\_name, nickname, preferred\_username, profile, picture, website, gender, birthdate, zoneinfo, locale, and updated\_at)
+> * email - (email, email\_verified)
+> * address - (address)
+> * phone - (phone\_number, phone\_number\_verified)
+>
 
 Once created you can view the details of the resource server.
 
@@ -134,4 +167,108 @@ the server with:
 
 Each resource server has unique signing keys and access secrets, so this is limited to each
 resource server.
+
+## Extended Options for Legacy Clients
+
+Not all resource servers support modern standards like PKCE or ECDSA. In these situations
+it may be necessary to disable these on a per-resource server basis. Disabling these on
+one resource server will not affect others.
+
+To disable PKCE for a resource server:
+
+    kanidm system oauth2 warning_insecure_client_disable_pkce <resource server name>
+
+To enable legacy cryptograhy (RSA PKCS1-5 SHA256):
+
+    kanidm system oauth2 warning_enable_legacy_crypto <resource server name>
+
+## Example Integrations
+
+### Apache mod\_auth\_openidc
+
+Add the following to a `mod_auth_openidc.conf`. It should be included in a `mods_enabled` folder
+or with an appropriate include.
+
+    OIDCRedirectURI /protected/redirect_uri
+    OIDCCryptoPassphrase <random password here>
+    OIDCProviderMetadataURL https://kanidm.example.com/oauth2/openid/<resource server name>/.well-known/openid-configuration
+    OIDCScope "openid" 
+    OIDCUserInfoTokenMethod authz_header
+    OIDCClientID <resource server name>
+    OIDCClientSecret <resource server password>
+    OIDCPKCEMethod S256
+    OIDCCookieSameSite On
+    # Set the `REMOTE_USER` field to the `preferred_username` instead of the UUID.
+    # Remember that the username can change, but this can help with systems like Nagios which use this as a display name.
+    # OIDCRemoteUserClaim preferred_username
+
+Other scopes can be added as required to the `OIDCScope` line, eg: `OIDCScope "openid scope2 scope3"`
+
+In the virtual host, to protect a location:
+
+    <Location />
+        AuthType openid-connect
+        Require valid-user
+    </Location>
+
+### Nextcloud
+
+Install the module [from the nextcloud market place](https://apps.nextcloud.com/apps/user_oidc) -
+it can also be found in the Apps section of your deployment as "OpenID Connect user backend".
+
+In nextcloud's config.php you need to allow connection to remote servers:
+
+    'allow_local_remote_servers' => true,
+
+You may optionally choose to add:
+
+    'allow_user_to_change_display_name' => false,
+    'lost_password_link' => 'disabled',
+
+If you forget this, you may see the following error in logs:
+
+    Host 172.24.11.129 was not connected to because it violates local access rules
+
+This module does not support PKCE or ES256. You will need to run:
+
+    kanidm system oauth2 warning_insecure_client_disable_pkce <resource server name>
+    kanidm system oauth2 warning_enable_legacy_crypto <resource server name>
+
+In the settings menu, configure the discovery url and client id and secret.
+
+You can choose to disable other login methods with:
+
+    php occ config:app:set --value=0 user_oidc allow_multiple_user_backends
+
+You can login directly by appending `?direct=1` to your login page still. You can re-enable
+other backends by setting the value to `1`
+
+### Velociraptor
+
+Velociraptor supports OIDC. To configure it select "Authenticate with SSO" then "OIDC" during
+the interactive configuration generator. Alternately, you can set the following keys in server.config.yaml:
+
+    GUI:
+      authenticator:
+        type: OIDC
+        oidc_issuer: https://idm.example.com/oauth2/openid/:client\_id:/
+        oauth_client_id: <resource server name/>
+        oauth_client_secret: <resource server secret>
+
+Velociraptor does not support PKCE. You will need to run the following:
+
+    kanidm system oauth2 warning_insecure_client_disable_pkce <resource server name>
+
+Initial users are mapped via their email in the Velociraptor server.config.yaml config:
+
+    GUI:
+      initial_users:
+      - name: <email address>
+
+Accounts require the `openid` and `email` scopes to be authenticated. It is recommended you limit
+these to a group with a scope map due to Velociraptors high impact.
+
+    # kanidm group create velociraptor_users
+    # kanidm group add_members velociraptor_users ...
+    kanidm system oauth2 create_scope_map <resource server name> velociraptor_users openid email
 

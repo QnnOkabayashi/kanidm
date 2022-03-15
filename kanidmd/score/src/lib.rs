@@ -8,32 +8,50 @@
 //! the entry point for all client traffic which is then directed to the
 //! various `actors`.
 
+#![deny(warnings)]
+#![warn(unused_extern_crates)]
+#![deny(clippy::todo)]
+#![deny(clippy::unimplemented)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::panic)]
+#![deny(clippy::unreachable)]
+#![deny(clippy::await_holding_lock)]
+#![deny(clippy::needless_pass_by_value)]
+#![deny(clippy::trivially_copy_pass_by_ref)]
+
+#[macro_use]
+extern crate tracing;
+#[macro_use]
+extern crate kanidm;
+
 mod https;
 mod ldaps;
 use libc::umask;
 
 // use crossbeam::channel::unbounded;
-use crate::prelude::*;
+use kanidm::prelude::*;
 use std::sync::Arc;
 
-use crate::config::Configuration;
+use kanidm::config::Configuration;
 
 // SearchResult
 // use self::ctx::ServerCtx;
-use crate::actors::v1_read::QueryServerReadV1;
-use crate::actors::v1_write::QueryServerWriteV1;
-use crate::be::{Backend, BackendConfig, BackendTransaction, FsType};
-use crate::crypto::setup_tls;
-use crate::idm::server::{IdmServer, IdmServerDelayed};
-use crate::interval::IntervalActor;
-use crate::ldap::LdapServer;
-use crate::schema::Schema;
-use crate::status::StatusActor;
-use crate::utils::{duration_from_epoch_now, touch_file_or_quit};
+use kanidm::actors::v1_read::QueryServerReadV1;
+use kanidm::actors::v1_write::QueryServerWriteV1;
+use kanidm::be::{Backend, BackendConfig, BackendTransaction, FsType};
+use kanidm::crypto::setup_tls;
+use kanidm::idm::server::{IdmServer, IdmServerDelayed};
+use kanidm::interval::IntervalActor;
+use kanidm::ldap::LdapServer;
+use kanidm::schema::Schema;
+use kanidm::status::StatusActor;
+use kanidm::utils::{duration_from_epoch_now, touch_file_or_quit};
 
 use kanidm_proto::v1::OperationError;
 
 use async_std::task;
+use compact_jwt::JwsSigner;
 
 // === internal setup helpers
 
@@ -70,9 +88,7 @@ fn setup_backend_vacuum(
         config.db_arc_size,
     );
 
-    let be = Backend::new(cfg, idxmeta, vacuum);
-    // debug!
-    be
+    Backend::new(cfg, idxmeta, vacuum)
 }
 
 // TODO #54: We could move most of the be/schema/qs setup and startup
@@ -85,7 +101,7 @@ fn setup_qs_idms(
     config: &Configuration,
 ) -> Result<(QueryServer, IdmServer, IdmServerDelayed), OperationError> {
     // Create a query_server implementation
-    let query_server = QueryServer::new(be, schema);
+    let query_server = QueryServer::new(be, schema, config.domain.clone());
 
     // TODO #62: Should the IDM parts be broken out to the IdmServer?
     // What's important about this initial setup here is that it also triggers
@@ -99,9 +115,30 @@ fn setup_qs_idms(
 
     // We generate a SINGLE idms only!
 
-    let (idms, idms_delayed) = IdmServer::new(query_server.clone(), config.origin.clone())?;
+    let (idms, idms_delayed) = IdmServer::new(query_server.clone(), &config.origin)?;
 
     Ok((query_server, idms, idms_delayed))
+}
+
+fn setup_qs(
+    be: Backend,
+    schema: Schema,
+    config: &Configuration,
+) -> Result<QueryServer, OperationError> {
+    // Create a query_server implementation
+    let query_server = QueryServer::new(be, schema, config.domain.clone());
+
+    // TODO #62: Should the IDM parts be broken out to the IdmServer?
+    // What's important about this initial setup here is that it also triggers
+    // the schema and acp reload, so they are now configured correctly!
+    // Initialise the schema core.
+    //
+    // Now search for the schema itself, and validate that the system
+    // in memory matches the BE on disk, and that it's syntactically correct.
+    // Write it out if changes are needed.
+    query_server.initialise_helper(duration_from_epoch_now())?;
+
+    Ok(query_server)
 }
 
 macro_rules! dbscan_setup_be {
@@ -356,7 +393,7 @@ pub fn vacuum_server_core(config: &Configuration) {
     };
 }
 
-pub fn domain_rename_core(config: &Configuration, new_domain_name: &str) {
+pub fn domain_rename_core(config: &Configuration) {
     let schema = match Schema::new() {
         Ok(s) => s,
         Err(e) => {
@@ -373,19 +410,35 @@ pub fn domain_rename_core(config: &Configuration, new_domain_name: &str) {
             return;
         }
     };
-    // setup the qs - *with* init of the migrations and schema.
-    let (qs, _idms, _idms_delayed) = match setup_qs_idms(be, schema, config) {
+
+    // setup the qs - *with out* init of the migrations and schema.
+    let qs = match setup_qs(be, schema, config) {
         Ok(t) => t,
         Err(e) => {
-            error!("Unable to setup query server or idm server -> {:?}", e);
+            error!("Unable to setup query server -> {:?}", e);
             return;
         }
     };
 
+    let new_domain_name = config.domain.as_str();
+
+    // make sure we're actually changing the domain name...
+    match task::block_on(qs.read_async()).get_db_domain_name() {
+        Ok(old_domain_name) => {
+            admin_info!(?old_domain_name, ?new_domain_name);
+            if &old_domain_name == &new_domain_name {
+                admin_info!("Domain name not changing, stopping.");
+                return;
+            }
+        }
+        Err(e) => {
+            admin_error!("Failed to query domain name, quitting! -> {:?}", e);
+            return;
+        }
+    }
+
     let qs_write = task::block_on(qs.write_async(duration_from_epoch_now()));
-    let r = qs_write
-        .domain_rename(new_domain_name)
-        .and_then(|_| qs_write.commit());
+    let r = qs_write.domain_rename().and_then(|_| qs_write.commit());
 
     match r {
         Ok(_) => info!("Domain Rename Success!"),
@@ -413,7 +466,7 @@ pub fn verify_server_core(config: &Configuration) {
             return;
         }
     };
-    let server = QueryServer::new(be, schema_mem);
+    let server = QueryServer::new(be, schema_mem, config.domain.clone());
 
     // Run verifications.
     let r = server.verify();
@@ -477,7 +530,7 @@ pub fn recover_account_core(config: &Configuration, name: &str) {
     eprintln!("Success - password reset to -> {}", new_pw);
 }
 
-pub async fn create_server_core(config: Configuration) -> Result<(), ()> {
+pub async fn create_server_core(config: Configuration, config_test: bool) -> Result<(), ()> {
     // Until this point, we probably want to write to the log macro fns.
 
     if config.integration_test_config.is_some() {
@@ -485,7 +538,11 @@ pub async fn create_server_core(config: Configuration) -> Result<(), ()> {
         warn!("IF YOU SEE THIS IN PRODUCTION YOU MUST CONTACT SUPPORT IMMEDIATELY.");
     }
 
-    info!("Starting kanidm with configuration: {}", config);
+    info!(
+        "Starting kanidm with configuration: {} {}",
+        if config_test { "TEST" } else { "" },
+        config
+    );
     // Setup umask, so that every we touch or create is secure.
     let _ = unsafe { umask(0o0027) };
 
@@ -529,10 +586,10 @@ pub async fn create_server_core(config: Configuration) -> Result<(), ()> {
 
     // Extract any configuration from the IDMS that we may need.
     // For now we just do this per run, but we need to extract this from the db later.
-    let bundy_key = match bundy::hs512::HS512::generate_key() {
+    let jws_signer = match JwsSigner::generate_hs256() {
         Ok(k) => k,
         Err(e) => {
-            error!("Unable to setup bundy -> {:?}", e);
+            error!("Unable to setup jws signer -> {:?}", e);
             return Err(());
         }
     };
@@ -609,7 +666,11 @@ pub async fn create_server_core(config: Configuration) -> Result<(), ()> {
                     return Err(());
                 }
             };
-            ldaps::create_ldap_server(la.as_str(), opt_ldap_tls_params, server_read_ref).await?;
+            if !config_test {
+                // ⚠️  only start the sockets and listeners in non-config-test modes.
+                ldaps::create_ldap_server(la.as_str(), opt_ldap_tls_params, server_read_ref)
+                    .await?;
+            }
         }
         None => {
             debug!("LDAP not requested, skipping");
@@ -622,19 +683,24 @@ pub async fn create_server_core(config: Configuration) -> Result<(), ()> {
     // domain will come from the qs now!
     let cookie_key: [u8; 32] = config.cookie_key;
 
-    self::https::create_https_server(
-        config.address,
-        // opt_tls_params,
-        config.tls_config.as_ref(),
-        config.role,
-        &cookie_key,
-        &bundy_key,
-        status_ref,
-        server_write_ref,
-        server_read_ref,
-    )?;
+    if config_test {
+        admin_info!("this config rocks! 🪨 ");
+    } else {
+        // ⚠️  only start the sockets and listeners in non-config-test modes.
+        self::https::create_https_server(
+            config.address,
+            // opt_tls_params,
+            config.tls_config.as_ref(),
+            config.role,
+            &cookie_key,
+            jws_signer,
+            status_ref,
+            server_write_ref,
+            server_read_ref,
+        )?;
 
-    info!("ready to rock! 🧱");
+        admin_info!("ready to rock! 🪨 ");
+    }
 
     Ok(())
 }

@@ -1,18 +1,26 @@
-use crate::event::AuthResult;
-use crate::filter::{Filter, FilterInvalid};
-use crate::idm::AuthState;
-use crate::prelude::*;
-use crate::status::StatusRequestEvent;
+use kanidm::event::AuthResult;
+use kanidm::filter::{Filter, FilterInvalid};
+use kanidm::idm::AuthState;
+use kanidm::prelude::*;
+use kanidm::status::StatusRequestEvent;
 
 use kanidm_proto::v1::Entry as ProtoEntry;
 use kanidm_proto::v1::{
-    AccountUnixExtend, AuthRequest, AuthResponse, AuthState as ProtoAuthState, CreateRequest,
-    DeleteRequest, GroupUnixExtend, ModifyRequest, OperationError, SearchRequest,
+    AccountPersonExtend, AccountUnixExtend, AuthRequest, AuthResponse, AuthState as ProtoAuthState,
+    CreateRequest, DeleteRequest, GroupUnixExtend, ModifyRequest, OperationError, SearchRequest,
     SetCredentialRequest, SingleStringRequest,
 };
 
 use super::{to_tide_response, AppState, RequestExtensions};
 use async_std::task;
+use compact_jwt::Jws;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct SessionId {
+    pub sessionid: Uuid,
+}
 
 pub async fn create(mut req: tide::Request<AppState>) -> tide::Result {
     let uat = req.get_current_uat();
@@ -347,7 +355,7 @@ pub async fn person_get(req: tide::Request<AppState>) -> tide::Result {
 }
 
 pub async fn person_post(req: tide::Request<AppState>) -> tide::Result {
-    let classes = vec!["account".to_string(), "object".to_string()];
+    let classes = vec!["person".to_string(), "object".to_string()];
     json_rest_event_post(req, classes).await
 }
 
@@ -545,14 +553,15 @@ pub async fn account_get_id_radius_token(req: tide::Request<AppState>) -> tide::
     to_tide_response(res, hvalue)
 }
 
-pub async fn account_post_id_person_extend(req: tide::Request<AppState>) -> tide::Result {
+pub async fn account_post_id_person_extend(mut req: tide::Request<AppState>) -> tide::Result {
     let uat = req.get_current_uat();
     let uuid_or_name = req.get_url_param("id")?;
+    let obj: AccountPersonExtend = req.body_json().await?;
     let (eventid, hvalue) = req.new_eventid();
     let res = req
         .state()
         .qe_w_ref
-        .handle_idmaccountpersonextend(uat, uuid_or_name, eventid)
+        .handle_idmaccountpersonextend(uat, uuid_or_name, obj, eventid)
         .await;
     to_tide_response(res, hvalue)
 }
@@ -816,15 +825,25 @@ pub async fn auth(mut req: tide::Request<AppState>) -> tide::Result {
                     msession.remove("auth-session-id");
                     msession
                         .insert("auth-session-id", sessionid)
-                        .map_err(|_| OperationError::InvalidSessionState)
+                        .map_err(|e| {
+                            error!(?e);
+                            OperationError::InvalidSessionState
+                        })
                         .and_then(|_| {
-                            let kref = &req.state().bundy_handle;
+                            let kref = &req.state().jws_signer;
+
+                            let jws = Jws {
+                                inner: SessionId { sessionid },
+                            };
                             // Get the header token ready.
-                            kref.sign(&sessionid)
-                                .map(|t| {
-                                    auth_session_id_tok = Some(t);
+                            jws.sign(&kref)
+                                .map(|jwss| {
+                                    auth_session_id_tok = Some(jwss.to_string());
                                 })
-                                .map_err(|_| OperationError::InvalidSessionState)
+                                .map_err(|e| {
+                                    error!(?e);
+                                    OperationError::InvalidSessionState
+                                })
                         })
                         .map(|_| ProtoAuthState::Choose(allowed))
                 }
@@ -835,15 +854,24 @@ pub async fn auth(mut req: tide::Request<AppState>) -> tide::Result {
                     msession.remove("auth-session-id");
                     msession
                         .insert("auth-session-id", sessionid)
-                        .map_err(|_| OperationError::InvalidSessionState)
+                        .map_err(|e| {
+                            error!(?e);
+                            OperationError::InvalidSessionState
+                        })
                         .and_then(|_| {
-                            let kref = &req.state().bundy_handle;
+                            let kref = &req.state().jws_signer;
                             // Get the header token ready.
-                            kref.sign(&sessionid)
-                                .map(|t| {
-                                    auth_session_id_tok = Some(t);
+                            let jws = Jws {
+                                inner: SessionId { sessionid },
+                            };
+                            jws.sign(&kref)
+                                .map(|jwss| {
+                                    auth_session_id_tok = Some(jwss.to_string());
                                 })
-                                .map_err(|_| OperationError::InvalidSessionState)
+                                .map_err(|e| {
+                                    error!(?e);
+                                    OperationError::InvalidSessionState
+                                })
                         })
                         .map(|_| ProtoAuthState::Continue(allowed))
                 }

@@ -42,13 +42,12 @@ use tracing::trace;
 use crate::be::dbentry::{DbEntry, DbEntryV1, DbEntryVers};
 use crate::be::{IdxKey, IdxSlope};
 
-use ldap3_server::simple::{LdapPartialAttribute, LdapSearchResultEntry};
+use hashbrown::HashMap;
+use ldap3_proto::simple::{LdapPartialAttribute, LdapSearchResultEntry};
+use smartstring::alias::String as AttrString;
 use std::collections::BTreeMap as Map;
 pub use std::collections::BTreeSet as Set;
 use std::collections::BTreeSet;
-// use hashbrown::HashMap as Map;
-use hashbrown::HashMap;
-use smartstring::alias::String as AttrString;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -428,8 +427,12 @@ impl Entry<EntryInit, EntryNew> {
                         }).collect();
                         vs.unwrap()
                     }
-                    "domain_token_key" => {
+                    "domain_token_key" | "fernet_private_key_str" => {
                         let vs: Option<ValueSet> = vs.into_iter().map(|v| Value::new_secret_str(&v)).collect();
+                        vs.unwrap()
+                    }
+                    "es256_private_key_der" => {
+                        let vs: Option<ValueSet> = vs.into_iter().map(|v| Value::new_privatebinary_base64(&v)).collect();
                         vs.unwrap()
                     }
                     ia => {
@@ -1269,7 +1272,6 @@ impl Entry<EntrySealed, EntryCommitted> {
         }
     }
 
-    // ! TRACING INTEGRATED
     pub fn from_dbentry(db_e: DbEntry, id: u64) -> Option<Self> {
         // Convert attrs from db format to value
         let r_attrs: Result<Map<AttrString, ValueSet>, ()> = match db_e.ent {
@@ -1279,12 +1281,11 @@ impl Entry<EntrySealed, EntryCommitted> {
                 // Skip anything empty as new VS can't deal with it.
                 .filter(|(_k, vs)| !vs.is_empty())
                 .map(|(k, vs)| {
-                    let vv: Result<Option<ValueSet>, ()> =
-                        vs.into_iter().map(Value::from_db_valuev1).collect();
+                    let vv: Result<ValueSet, _> = ValueSet::from_db_valuev1_iter(vs.into_iter());
                     match vv {
-                        Ok(Some(vv)) => Ok((k, vv)),
-                        _ => {
-                            admin_error!(value = ?k, "from_dbentry failed");
+                        Ok(vv) => Ok((k, vv)),
+                        Err(e) => {
+                            admin_error!(?e, value = ?k, "from_dbentry failed");
                             Err(())
                         }
                     }
@@ -1451,7 +1452,6 @@ impl Entry<EntryReduced, EntryCommitted> {
     }
 
     /// Transform this reduced entry into a JSON protocol form that can be sent to clients.
-    // ! TRACING INTEGRATED
     pub fn to_pe(&self, qs: &QueryServerReadTransaction) -> Result<ProtoEntry, OperationError> {
         // Turn values -> Strings.
         let attrs: Result<_, _> = self
@@ -1651,6 +1651,12 @@ impl<VALID, STATE> Entry<VALID, STATE> {
         self.attrs.get(attr).and_then(|vs| vs.to_value_single())
     }
 
+    pub fn get_ava_single_proto_string(&self, attr: &str) -> Option<String> {
+        self.attrs
+            .get(attr)
+            .and_then(|vs| vs.to_proto_string_single())
+    }
+
     #[inline(always)]
     /// Return a single bool, if valid to transform this value into a boolean.
     pub fn get_ava_single_bool(&self, attr: &str) -> Option<bool> {
@@ -1711,12 +1717,28 @@ impl<VALID, STATE> Entry<VALID, STATE> {
         self.attrs.get(attr).and_then(|vs| vs.to_refer_single())
     }
 
+    pub fn get_ava_mail_primary(&self, attr: &str) -> Option<&str> {
+        self.attrs
+            .get(attr)
+            .and_then(|vs| vs.to_email_address_primary_str())
+    }
+
+    pub fn get_ava_iter_mail(&self, attr: &str) -> Option<impl Iterator<Item = &str>> {
+        self.get_ava_set(attr).and_then(|vs| vs.as_email_str_iter())
+    }
+
     #[inline(always)]
     /// Return a single protocol filter, if valid to transform this value.
     pub fn get_ava_single_protofilter(&self, attr: &str) -> Option<&ProtoFilter> {
         self.attrs
             .get(attr)
             .and_then(|vs| vs.to_json_filter_single())
+    }
+
+    pub fn get_ava_single_private_binary(&self, attr: &str) -> Option<&[u8]> {
+        self.attrs
+            .get(attr)
+            .and_then(|vs| vs.to_private_binary_single())
     }
 
     #[inline(always)]

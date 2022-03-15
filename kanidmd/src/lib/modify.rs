@@ -12,6 +12,7 @@ use crate::value::{PartialValue, Value};
 use kanidm_proto::v1::{OperationError, SchemaError};
 
 // Should this be std?
+use serde::{Deserialize, Serialize};
 use smartstring::alias::String as AttrString;
 use std::slice;
 
@@ -60,6 +61,8 @@ impl Modify {
 
 #[derive(Debug, Default)]
 pub struct ModifyList<VALID> {
+    // This is never read, it's just used for state machine enforcement.
+    #[allow(dead_code)]
     valid: VALID,
     // The order of this list matters. Each change must be done in order.
     mods: Vec<Modify>,
@@ -230,5 +233,9 @@ impl ModifyList<ModifyValid> {
 impl<VALID> ModifyList<VALID> {
     pub fn len(&self) -> usize {
         self.mods.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }

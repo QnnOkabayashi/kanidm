@@ -15,9 +15,10 @@ use crate::idm::event::{
 };
 use crate::idm::mfareg::{MfaRegCred, MfaRegNext, MfaRegSession};
 use crate::idm::oauth2::{
-    AccessTokenRequest, AccessTokenResponse, AuthorisationRequest, AuthorisePermitSuccess,
-    ConsentRequest, Oauth2Error, Oauth2ResourceServers, Oauth2ResourceServersReadTransaction,
-    Oauth2ResourceServersWriteTransaction,
+    AccessTokenIntrospectRequest, AccessTokenIntrospectResponse, AccessTokenRequest,
+    AccessTokenResponse, AuthorisationRequest, AuthorisePermitSuccess, ConsentRequest, JwkKeySet,
+    Oauth2Error, Oauth2ResourceServers, Oauth2ResourceServersReadTransaction,
+    Oauth2ResourceServersWriteTransaction, OidcDiscoveryResponse, OidcToken,
 };
 use crate::idm::radius::RadiusAccount;
 use crate::idm::unix::{UnixGroup, UnixUserAccount};
@@ -40,9 +41,9 @@ use kanidm_proto::v1::{
     AuthType, BackupCodesView, CredentialStatus, RadiusAuthToken, SetCredentialResponse,
     UnixGroupToken, UnixUserToken, UserAuthToken,
 };
-use std::str::FromStr;
 
-use bundy::hs512::HS512;
+use compact_jwt::{Jws, JwsSigner, JwsUnverified, JwsValidator};
+use fernet::Fernet;
 
 use tokio::sync::mpsc::{
     unbounded_channel as unbounded, UnboundedReceiver as Receiver, UnboundedSender as Sender,
@@ -56,15 +57,16 @@ use futures::task as futures_task;
 
 use concread::{
     bptree::{BptreeMap, BptreeMapWriteTxn},
-    CowCell,
-};
-use concread::{
     cowcell::{CowCellReadTxn, CowCellWriteTxn},
     hashmap::HashMap,
+    CowCell,
 };
+
 use rand::prelude::*;
 use std::convert::TryFrom;
+use std::str::FromStr;
 use std::{sync::Arc, time::Duration};
+use tokio::sync::Mutex;
 use url::Url;
 
 use webauthn_rs::Webauthn;
@@ -74,18 +76,22 @@ use super::event::{GenerateBackupCodeEvent, ReadBackupCodeEvent, RemoveBackupCod
 
 use tracing::trace;
 
+type AuthSessionMutex = Arc<Mutex<AuthSession>>;
+type CredSoftLockMutex = Arc<Mutex<CredSoftLock>>;
+
+// type CredUpdateSessionMutex = Arc<Mutex<CredUpdateSession>>;
+
 pub struct IdmServer {
     // There is a good reason to keep this single thread - it
     // means that limits to sessions can be easily applied and checked to
     // variaous accounts, and we have a good idea of how to structure the
     // in memory caches related to locking.
     session_ticket: Semaphore,
-    sessions: BptreeMap<Uuid, AuthSession>,
-    // Do we need a softlock ticket?
-    softlock_ticket: Semaphore,
-    softlocks: HashMap<Uuid, CredSoftLock>,
+    sessions: BptreeMap<Uuid, AuthSessionMutex>,
+    softlocks: HashMap<Uuid, CredSoftLockMutex>,
     /// A set of in progress MFA registrations
     mfareg_sessions: BptreeMap<Uuid, MfaRegSession>,
+    // cred_update_sessions: BptreeMap<Uuid, CredUpdateSessionMutex>,
     /// Reference to the query server.
     qs: QueryServer,
     /// The configured crypto policy for the IDM server. Later this could be transactional and loaded from the db similar to access. But today it's just to allow dynamic pbkdf2rounds
@@ -95,16 +101,18 @@ pub struct IdmServer {
     webauthn: Webauthn<WebauthnDomainConfig>,
     pw_badlist_cache: Arc<CowCell<HashSet<String>>>,
     oauth2rs: Arc<Oauth2ResourceServers>,
-    uat_bundy_hmac: Arc<CowCell<HS512>>,
+
+    uat_jwt_signer: Arc<CowCell<JwsSigner>>,
+    uat_jwt_validator: Arc<CowCell<JwsValidator>>,
+    token_enc_key: Arc<CowCell<Fernet>>,
 }
 
 /// Contains methods that require writes, but in the context of writing to the idm in memory structures (maybe the query server too). This is things like authentication.
 pub struct IdmServerAuthTransaction<'a> {
     session_ticket: &'a Semaphore,
-    sessions: &'a BptreeMap<Uuid, AuthSession>,
+    sessions: &'a BptreeMap<Uuid, AuthSessionMutex>,
+    softlocks: &'a HashMap<Uuid, CredSoftLockMutex>,
 
-    softlock_ticket: &'a Semaphore,
-    softlocks: &'a HashMap<Uuid, CredSoftLock>,
     pub qs_read: QueryServerReadTransaction<'a>,
     /// Thread/Server ID
     sid: Sid,
@@ -112,13 +120,14 @@ pub struct IdmServerAuthTransaction<'a> {
     async_tx: Sender<DelayedAction>,
     webauthn: &'a Webauthn<WebauthnDomainConfig>,
     pw_badlist_cache: CowCellReadTxn<HashSet<String>>,
-    uat_bundy_hmac: CowCellReadTxn<HS512>,
+    uat_jwt_signer: CowCellReadTxn<JwsSigner>,
+    uat_jwt_validator: CowCellReadTxn<JwsValidator>,
 }
 
 /// This contains read-only methods, like getting users, groups and other structured content.
 pub struct IdmServerProxyReadTransaction<'a> {
     pub qs_read: QueryServerReadTransaction<'a>,
-    uat_bundy_hmac: CowCellReadTxn<HS512>,
+    uat_jwt_validator: CowCellReadTxn<JwsValidator>,
     oauth2rs: Oauth2ResourceServersReadTransaction,
 }
 
@@ -132,7 +141,9 @@ pub struct IdmServerProxyWriteTransaction<'a> {
     crypto_policy: &'a CryptoPolicy,
     webauthn: &'a Webauthn<WebauthnDomainConfig>,
     pw_badlist_cache: CowCellWriteTxn<'a, HashSet<String>>,
-    uat_bundy_hmac: CowCellWriteTxn<'a, HS512>,
+    uat_jwt_signer: CowCellWriteTxn<'a, JwsSigner>,
+    uat_jwt_validator: CowCellWriteTxn<'a, JwsValidator>,
+    token_enc_key: CowCellWriteTxn<'a, Fernet>,
     oauth2rs: Oauth2ResourceServersWriteTransaction<'a>,
 }
 
@@ -144,7 +155,7 @@ impl IdmServer {
     // TODO: Make number of authsessions configurable!!!
     pub fn new(
         qs: QueryServer,
-        origin: String,
+        origin: &str,
         // ct: Duration,
     ) -> Result<(IdmServer, IdmServerDelayed), OperationError> {
         // This is calculated back from:
@@ -158,11 +169,12 @@ impl IdmServer {
         let (async_tx, async_rx) = unbounded();
 
         // Get the domain name, as the relying party id.
-        let (rp_id, token_key, pw_badlist_set, oauth2rs_set) = {
+        let (rp_id, fernet_private_key, es256_private_key, pw_badlist_set, oauth2rs_set) = {
             let qs_read = task::block_on(qs.read_async());
             (
-                qs_read.get_domain_name()?,
-                qs_read.get_domain_token_key()?,
+                qs_read.get_domain_name().to_string(),
+                qs_read.get_domain_fernet_private_key()?,
+                qs_read.get_domain_es256_private_key()?,
                 qs_read.get_password_badlist()?,
                 // Add a read/reload of all oauth2 configurations.
                 qs_read.get_oauth2rs_set()?,
@@ -170,20 +182,25 @@ impl IdmServer {
         };
 
         // Check that it gels with our origin.
-        let origin_url = Url::parse(origin.as_str())
+        let origin_url = Url::parse(origin)
             .map_err(|_e| {
                 admin_error!("Unable to parse origin URL - refusing to start. You must correct the value for origin. {:?}", origin);
                 OperationError::InvalidState
             })
             .and_then(|url| {
                 let valid = url.domain().map(|effective_domain| {
-                    effective_domain.ends_with(&rp_id)
+                    // We need to prepend the '.' here to ensure that myexample.com != example.com,
+                    // rather than just ends with.
+                    effective_domain.ends_with(&format!(".{}", rp_id)) 
+                    || effective_domain == rp_id
                 }).unwrap_or(false);
 
                 if valid {
                     Ok(url)
                 } else {
-                    admin_error!("Effective domain is not a descendent of server domain name (rp_id). You must change origin or domain name to be consistent. ed: {:?} - rp_id: {:?}", origin, rp_id);
+                    admin_error!("Effective domain is not a descendent of server domain name (rp_id).");
+                    admin_error!("You must change origin or domain name to be consistent. ed: {:?} - rp_id: {:?}", origin, rp_id);
+                    admin_error!("To change the origin or domain name see: https://kanidm.github.io/kanidm/server_configuration.html");
                     Err(OperationError::InvalidState)
                 }
             })?;
@@ -193,27 +210,40 @@ impl IdmServer {
 
         let webauthn = Webauthn::new(WebauthnDomainConfig {
             rp_name,
-            origin: origin_url,
+            origin: origin_url.clone(),
             rp_id,
         });
 
         // Setup our auth token signing key.
-        let bundy_handle = HS512::from_str(&token_key).map_err(|e| {
-            admin_error!("Failed to generate uat_bundy_hmac - {:?}", e);
-            OperationError::InvalidState
+        let fernet_key = Fernet::new(&fernet_private_key).ok_or_else(|| {
+            admin_error!("Unable to load Fernet encryption key");
+            OperationError::CryptographyError
         })?;
-        let uat_bundy_hmac = Arc::new(CowCell::new(bundy_handle));
+        let token_enc_key = Arc::new(CowCell::new(fernet_key));
 
-        let oauth2rs = Oauth2ResourceServers::try_from(oauth2rs_set).map_err(|e| {
-            admin_error!("Failed to load oauth2 resource servers - {:?}", e);
-            e
+        let jwt_signer = JwsSigner::from_es256_der(&es256_private_key).map_err(|e| {
+            admin_error!(err = ?e, "Unable to load ES256 JwsSigner from DER");
+            OperationError::CryptographyError
         })?;
+
+        let jwt_validator = jwt_signer.get_validator().map_err(|e| {
+            admin_error!(err = ?e, "Unable to load ES256 JwsValidator from JwsSigner");
+            OperationError::CryptographyError
+        })?;
+
+        let uat_jwt_signer = Arc::new(CowCell::new(jwt_signer));
+        let uat_jwt_validator = Arc::new(CowCell::new(jwt_validator));
+
+        let oauth2rs =
+            Oauth2ResourceServers::try_from((oauth2rs_set, origin_url)).map_err(|e| {
+                admin_error!("Failed to load oauth2 resource servers - {:?}", e);
+                e
+            })?;
 
         Ok((
             IdmServer {
                 session_ticket: Semaphore::new(1),
                 sessions: BptreeMap::new(),
-                softlock_ticket: Semaphore::new(1),
                 softlocks: HashMap::new(),
                 mfareg_sessions: BptreeMap::new(),
                 qs,
@@ -221,7 +251,9 @@ impl IdmServer {
                 async_tx,
                 webauthn,
                 pw_badlist_cache: Arc::new(CowCell::new(pw_badlist_set)),
-                uat_bundy_hmac,
+                uat_jwt_signer,
+                uat_jwt_validator,
+                token_enc_key,
                 oauth2rs: Arc::new(oauth2rs),
             },
             IdmServerDelayed { async_rx },
@@ -238,22 +270,19 @@ impl IdmServer {
         let mut rng = StdRng::from_entropy();
         rng.fill(&mut sid);
 
-        // let session_ticket = self.session_ticket.acquire().await;
         let qs_read = self.qs.read_async().await;
 
         IdmServerAuthTransaction {
-            // _session_ticket: session_ticket,
-            // sessions: self.sessions.write(),
             session_ticket: &self.session_ticket,
             sessions: &self.sessions,
-            softlock_ticket: &self.softlock_ticket,
             softlocks: &self.softlocks,
             qs_read,
             sid,
             async_tx: self.async_tx.clone(),
             webauthn: &self.webauthn,
             pw_badlist_cache: self.pw_badlist_cache.read(),
-            uat_bundy_hmac: self.uat_bundy_hmac.read(),
+            uat_jwt_signer: self.uat_jwt_signer.read(),
+            uat_jwt_validator: self.uat_jwt_validator.read(),
         }
     }
 
@@ -265,7 +294,7 @@ impl IdmServer {
     pub async fn proxy_read_async(&self) -> IdmServerProxyReadTransaction<'_> {
         IdmServerProxyReadTransaction {
             qs_read: self.qs.read_async().await,
-            uat_bundy_hmac: self.uat_bundy_hmac.read(),
+            uat_jwt_validator: self.uat_jwt_validator.read(),
             oauth2rs: self.oauth2rs.read(),
         }
     }
@@ -288,7 +317,9 @@ impl IdmServer {
             crypto_policy: &self.crypto_policy,
             webauthn: &self.webauthn,
             pw_badlist_cache: self.pw_badlist_cache.write(),
-            uat_bundy_hmac: self.uat_bundy_hmac.write(),
+            uat_jwt_signer: self.uat_jwt_signer.write(),
+            uat_jwt_validator: self.uat_jwt_validator.write(),
+            token_enc_key: self.token_enc_key.write(),
             oauth2rs: self.oauth2rs.write(),
         }
     }
@@ -327,7 +358,7 @@ impl IdmServerDelayed {
         }
     }
 
-    pub(crate) async fn process_all(&mut self, server: &'static QueryServerWriteV1) {
+    pub async fn process_all(&mut self, server: &'static QueryServerWriteV1) {
         loop {
             match self.async_rx.recv().await {
                 // process it.
@@ -339,31 +370,37 @@ impl IdmServerDelayed {
     }
 }
 
-pub trait IdmServerTransaction<'a> {
+pub(crate) trait IdmServerTransaction<'a> {
     type QsTransactionType: QueryServerTransaction<'a>;
 
     fn get_qs_txn(&self) -> &Self::QsTransactionType;
 
-    fn get_uat_bundy_txn(&self) -> &HS512;
+    fn get_uat_validator_txn(&self) -> &JwsValidator;
 
-    // ! TRACING INTEGRATED
     fn validate_and_parse_uat(
         &self,
         token: Option<&str>,
         ct: Duration,
     ) -> Result<UserAuthToken, OperationError> {
         // Given the token string, validate and recreate the UAT
-        let bref = self.get_uat_bundy_txn();
+        let jws_validator = self.get_uat_validator_txn();
 
-        let uat: UserAuthToken =
-            token
-                .ok_or(OperationError::NotAuthenticated)
-                .and_then(|token| {
-                    bref.verify(token).map_err(|e| {
+        let uat: UserAuthToken = token
+            .ok_or(OperationError::NotAuthenticated)
+            .and_then(|s| {
+                JwsUnverified::from_str(s).map_err(|e| {
+                    security_info!(?e, "Unable to decode token");
+                    OperationError::NotAuthenticated
+                })
+            })
+            .and_then(|jwtu| {
+                jwtu.validate(jws_validator)
+                    .map_err(|e| {
                         security_info!(?e, "Unable to verify token");
                         OperationError::NotAuthenticated
                     })
-                })?;
+                    .map(|t: Jws<UserAuthToken>| t.inner)
+            })?;
 
         if time::OffsetDateTime::unix_epoch() + ct >= uat.expiry {
             security_info!("Session expired");
@@ -373,7 +410,27 @@ pub trait IdmServerTransaction<'a> {
         }
     }
 
-    // ! TRACING INTEGRATED
+    fn check_account_uuid_valid(
+        &self,
+        uuid: &Uuid,
+        ct: Duration,
+    ) -> Result<Option<Account>, OperationError> {
+        let entry = self.get_qs_txn().internal_search_uuid(uuid).map_err(|e| {
+            admin_error!(?e, "check_account_uuid_valid failed");
+            e
+        })?;
+
+        if Account::check_within_valid_time(
+            ct,
+            entry.get_ava_single_datetime("account_valid_from").as_ref(),
+            entry.get_ava_single_datetime("account_expire").as_ref(),
+        ) {
+            Account::try_from_entry_no_groups(entry.as_ref()).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     fn process_uat_to_identity(
         &self,
         uat: &UserAuthToken,
@@ -447,8 +504,8 @@ impl<'a> IdmServerTransaction<'a> for IdmServerAuthTransaction<'a> {
         &self.qs_read
     }
 
-    fn get_uat_bundy_txn(&self) -> &HS512 {
-        &*self.uat_bundy_hmac
+    fn get_uat_validator_txn(&self) -> &JwsValidator {
+        &*self.uat_jwt_validator
     }
 }
 
@@ -471,7 +528,6 @@ impl<'a> IdmServerAuthTransaction<'a> {
         session_write.commit();
     }
 
-    // ! TRACING INTEGRATED
     pub async fn auth(
         &mut self,
         ae: &AuthEvent,
@@ -501,7 +557,7 @@ impl<'a> IdmServerAuthTransaction<'a> {
                 //
                 // Check anything needed? Get the current auth-session-id from request
                 // because it associates to the nonce's etc which were all cached.
-                let euuid = self.qs_read.name_to_uuid(init.name.as_str())?; // I CAN'T TRACE WHERE AUDITSCOPE GOES :(((
+                let euuid = self.qs_read.name_to_uuid(init.name.as_str())?;
 
                 // Get the first / single entry we expect here ....
                 let entry = self.qs_read.internal_search_uuid(&euuid)?;
@@ -518,32 +574,54 @@ impl<'a> IdmServerAuthTransaction<'a> {
                 // out of the session tree.
                 let account = Account::try_from_entry_ro(entry.as_ref(), &mut self.qs_read)?;
 
+                // Intent to take both trees to write.
+                let _session_ticket = self.session_ticket.acquire().await;
+
                 // Check the credential that the auth_session will attempt to
                 // use.
-                let is_valid = {
-                    let cred_uuid = account.primary_cred_uuid();
-                    // Acquire the softlock map
-                    let _softlock_ticket = self.softlock_ticket.acquire().await;
-                    let mut softlock_write = self.softlocks.write();
-                    // Does it exist?
-                    let r = softlock_write
-                        .get_mut(&cred_uuid)
-                        .map(|slock| {
-                            // Apply the current time.
-                            slock.apply_time_step(ct);
-                            // Now check the results
-                            slock.is_valid()
-                        })
-                        .unwrap_or(true);
-                    softlock_write.commit();
-                    r
+                //
+                // NOTE: Very careful use of await here to avoid an issue with write.
+                let maybe_slock_ref =
+                    account
+                        .primary_cred_uuid_and_policy()
+                        .map(|(cred_uuid, policy)| {
+                            // Acquire the softlock map
+                            //
+                            // We have no issue calling this with .write here, since we
+                            // already hold the session_ticket above.
+                            let mut softlock_write = self.softlocks.write();
+                            let slock_ref: CredSoftLockMutex =
+                                if let Some(slock_ref) = softlock_write.get(&cred_uuid) {
+                                    slock_ref.clone()
+                                } else {
+                                    // Create if not exist, and the cred type supports softlocking.
+                                    let slock = Arc::new(Mutex::new(CredSoftLock::new(policy)));
+                                    softlock_write.insert(cred_uuid, slock.clone());
+                                    slock
+                                };
+                            softlock_write.commit();
+                            slock_ref
+                        });
+
+                let mut maybe_slock = if let Some(slock_ref) = maybe_slock_ref.as_ref() {
+                    Some(slock_ref.lock().await)
+                } else {
+                    None
+                };
+
+                // Need to as_mut here so that we hold the slock for the whole operation.
+                let is_valid = if let Some(slock) = maybe_slock.as_mut() {
+                    slock.apply_time_step(ct);
+                    slock.is_valid()
+                } else {
+                    false
                 };
 
                 let (auth_session, state) = if is_valid {
                     AuthSession::new(account, self.webauthn, ct)
                 } else {
                     // it's softlocked, don't even bother.
-                    security_info!("Account is softlocked.");
+                    security_info!("Account is softlocked, or has no credentials associated.");
                     (
                         None,
                         AuthState::Denied("Account is temporarily locked".to_string()),
@@ -552,14 +630,12 @@ impl<'a> IdmServerAuthTransaction<'a> {
 
                 match auth_session {
                     Some(auth_session) => {
-                        // Now acquire the session tree for writing.
-                        let _session_ticket = self.session_ticket.acquire().await;
                         let mut session_write = self.sessions.write();
                         spanned!("idm::server::auth<Init> -> sessions", {
                             if session_write.contains_key(&sessionid) {
                                 Err(OperationError::InvalidSessionState)
                             } else {
-                                session_write.insert(sessionid, auth_session);
+                                session_write.insert(sessionid, Arc::new(Mutex::new(auth_session)));
                                 // Debugging: ensure we really inserted ...
                                 debug_assert!(session_write.get(&sessionid).is_some());
                                 Ok(())
@@ -587,34 +663,38 @@ impl<'a> IdmServerAuthTransaction<'a> {
             } // AuthEventStep::Init
             AuthEventStep::Begin(mech) => {
                 // lperf_segment!("idm::server::auth<Begin>", || {
-                let _session_ticket = self.session_ticket.acquire().await;
-                let _softlock_ticket = self.softlock_ticket.acquire().await;
+                // let _session_ticket = self.session_ticket.acquire().await;
 
-                let mut session_write = self.sessions.write();
+                let session_read = self.sessions.read();
                 // Do we have a session?
-                let auth_session = session_write
+                let auth_session_ref = session_read
                     // Why is the session missing?
-                    .get_mut(&mech.sessionid)
+                    .get(&mech.sessionid)
+                    .map(|auth_session_ref| auth_session_ref.clone())
                     .ok_or_else(|| {
                         admin_error!("Invalid Session State (no present session uuid)");
                         OperationError::InvalidSessionState
                     })?;
 
-                // From the auth_session, determine if the current account
-                // credential that we are using has become softlocked or not.
-                let mut softlock_write = self.softlocks.write();
+                let mut auth_session = auth_session_ref.lock().await;
 
-                let cred_uuid = auth_session.get_account().primary_cred_uuid();
-
-                let is_valid = softlock_write
-                    .get_mut(&cred_uuid)
-                    .map(|slock| {
-                        // Apply the current time.
-                        slock.apply_time_step(ct);
-                        // Now check the results
-                        slock.is_valid()
-                    })
-                    .unwrap_or(true);
+                let is_valid =
+                    if let Some(cred_uuid) = auth_session.get_account().primary_cred_uuid() {
+                        // From the auth_session, determine if the current account
+                        // credential that we are using has become softlocked or not.
+                        let softlock_read = self.softlocks.read();
+                        if let Some(slock_ref) = softlock_read.get(&cred_uuid) {
+                            let mut slock = slock_ref.lock().await;
+                            // Apply the current time.
+                            slock.apply_time_step(ct);
+                            // Now check the results
+                            slock.is_valid()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
 
                 let r = if is_valid {
                     // Indicate to the session which auth mech we now want to proceed with.
@@ -631,78 +711,88 @@ impl<'a> IdmServerAuthTransaction<'a> {
                         delay,
                     }
                 });
-                softlock_write.commit();
-                session_write.commit();
+                // softlock_write.commit();
+                // session_write.commit();
                 r
             } // End AuthEventStep::Mech
             AuthEventStep::Cred(creds) => {
                 // lperf_segment!("idm::server::auth<Creds>", || {
-                let _session_ticket = self.session_ticket.acquire().await;
-                let _softlock_ticket = self.softlock_ticket.acquire().await;
+                // let _session_ticket = self.session_ticket.acquire().await;
 
-                let mut session_write = self.sessions.write();
+                let session_read = self.sessions.read();
                 // Do we have a session?
-                let auth_session = session_write
+                let auth_session_ref = session_read
                     // Why is the session missing?
-                    .get_mut(&creds.sessionid)
+                    .get(&creds.sessionid)
+                    .map(|auth_session_ref| auth_session_ref.clone())
                     .ok_or_else(|| {
                         admin_error!("Invalid Session State (no present session uuid)");
                         OperationError::InvalidSessionState
                     })?;
 
+                let mut auth_session = auth_session_ref.lock().await;
+
+                let maybe_slock_ref =
+                    auth_session
+                        .get_account()
+                        .primary_cred_uuid()
+                        .and_then(|cred_uuid| {
+                            let softlock_read = self.softlocks.read();
+
+                            softlock_read.get(&cred_uuid).map(|s| s.clone())
+                        });
+
                 // From the auth_session, determine if the current account
                 // credential that we are using has become softlocked or not.
-                let mut softlock_write = self.softlocks.write();
 
-                let cred_uuid = auth_session.get_account().primary_cred_uuid();
+                let maybe_slock = if let Some(s) = maybe_slock_ref.as_ref() {
+                    Some(s.lock().await)
+                } else {
+                    None
+                };
 
-                let is_valid = softlock_write
-                    .get_mut(&cred_uuid)
-                    .map(|slock| {
-                        // Apply the current time.
-                        slock.apply_time_step(ct);
-                        // Now check the results
-                        slock.is_valid()
-                    })
-                    .unwrap_or(true);
+                let maybe_valid = if let Some(mut slock) = maybe_slock {
+                    // Apply the current time.
+                    slock.apply_time_step(ct);
+                    // Now check the results
+                    if slock.is_valid() {
+                        Some(slock)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
-                let r = if is_valid {
-                    // Process the credentials here as required.
-                    // Basically throw them at the auth_session and see what
-                    // falls out.
-                    let pw_badlist_cache = Some(&(*self.pw_badlist_cache));
-                    auth_session
-                        .validate_creds(
-                            &creds.cred,
-                            &ct,
-                            &self.async_tx,
-                            self.webauthn,
-                            pw_badlist_cache,
-                            &*self.uat_bundy_hmac,
-                        )
-                        .map(|aus| {
-                            // Inspect the result:
-                            // if it was a failure, we need to inc the softlock.
-                            if let AuthState::Denied(_) = &aus {
-                                if let Some(slock) = softlock_write.get_mut(&cred_uuid) {
+                let r = match maybe_valid {
+                    Some(mut slock) => {
+                        // Process the credentials here as required.
+                        // Basically throw them at the auth_session and see what
+                        // falls out.
+                        let pw_badlist_cache = Some(&(*self.pw_badlist_cache));
+                        auth_session
+                            .validate_creds(
+                                &creds.cred,
+                                &ct,
+                                &self.async_tx,
+                                self.webauthn,
+                                pw_badlist_cache,
+                                &*self.uat_jwt_signer,
+                            )
+                            .map(|aus| {
+                                // Inspect the result:
+                                // if it was a failure, we need to inc the softlock.
+                                if let AuthState::Denied(_) = &aus {
                                     // Update it.
                                     slock.record_failure(ct);
-                                } else {
-                                    // Create if not exist, and the cred type supports softlocking.
-                                    if let Some(policy) =
-                                        auth_session.get_account().primary_cred_softlock_policy()
-                                    {
-                                        let mut slock = CredSoftLock::new(policy);
-                                        slock.record_failure(ct);
-                                        softlock_write.insert(cred_uuid, slock);
-                                    }
-                                }
-                            };
-                            aus
-                        })
-                } else {
-                    // Fail the session
-                    auth_session.end_session("Account is temporarily locked")
+                                };
+                                aus
+                            })
+                    }
+                    _ => {
+                        // Fail the session
+                        auth_session.end_session("Account is temporarily locked")
+                    }
                 }
                 .map(|aus| {
                     // TODO: Change this william!
@@ -715,14 +805,13 @@ impl<'a> IdmServerAuthTransaction<'a> {
                         delay,
                     }
                 });
-                softlock_write.commit();
-                session_write.commit();
+                // softlock_write.commit();
+                // session_write.commit();
                 r
             } // End AuthEventStep::Cred
         }
     }
 
-    // ! TRACING INTEGRATED
     pub async fn auth_unix(
         &mut self,
         uae: &UnixUserAuthEvent,
@@ -745,45 +834,53 @@ impl<'a> IdmServerAuthTransaction<'a> {
             return Ok(None);
         }
 
-        let _softlock_ticket = self.softlock_ticket.acquire().await;
-        let mut softlock_write = self.softlocks.write();
+        let maybe_slock_ref = match account.unix_cred_uuid_and_policy() {
+            Some((cred_uuid, policy)) => {
+                let softlock_read = self.softlocks.read();
+                let slock_ref = match softlock_read.get(&cred_uuid) {
+                    Some(slock_ref) => slock_ref.clone(),
+                    None => {
+                        let _session_ticket = self.session_ticket.acquire().await;
+                        let mut softlock_write = self.softlocks.write();
+                        let slock = Arc::new(Mutex::new(CredSoftLock::new(policy)));
+                        softlock_write.insert(cred_uuid, slock.clone());
+                        softlock_write.commit();
+                        slock
+                    }
+                };
+                Some(slock_ref)
+            }
+            None => None,
+        };
 
-        let cred_uuid = account.unix_cred_uuid();
-        let is_valid = if let Some(cu) = cred_uuid.as_ref() {
-            // Advanced and then check the softlock.
-            softlock_write
-                .get_mut(cu)
-                .map(|slock| {
-                    // Apply the current time.
-                    slock.apply_time_step(ct);
-                    // Now check the results
-                    slock.is_valid()
-                })
-                // No sl, it's valid.
-                .unwrap_or(true)
+        let maybe_slock = if let Some(s) = maybe_slock_ref.as_ref() {
+            Some(s.lock().await)
         } else {
-            // No cred id? It'll fail in verify ...
-            true
+            None
+        };
+
+        let maybe_valid = if let Some(mut slock) = maybe_slock {
+            // Apply the current time.
+            slock.apply_time_step(ct);
+            // Now check the results
+            if slock.is_valid() {
+                Some(slock)
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         // Validate the unix_pw - this checks the account/cred lock states.
-        let res = if is_valid {
+        let res = if let Some(mut slock) = maybe_valid {
             // Account is unlocked, can proceed.
             account
                 .verify_unix_credential(uae.cleartext.as_str(), &self.async_tx, ct)
                 .map(|res| {
                     if res.is_none() {
-                        if let Some(cu) = cred_uuid.as_ref() {
-                            // Update the cred failure.
-                            if let Some(slock) = softlock_write.get_mut(cu) {
-                                // Update it.
-                                slock.record_failure(ct);
-                            } else if let Some(policy) = account.unix_cred_softlock_policy() {
-                                let mut slock = CredSoftLock::new(policy);
-                                slock.record_failure(ct);
-                                softlock_write.insert(*cu, slock);
-                            };
-                        }
+                        // Update it.
+                        slock.record_failure(ct);
                     };
                     res
                 })
@@ -792,12 +889,9 @@ impl<'a> IdmServerAuthTransaction<'a> {
             security_info!("Account is softlocked.");
             Ok(None)
         };
-
-        softlock_write.commit();
         res
     }
 
-    // TODO: tracing
     pub async fn auth_ldap(
         &mut self,
         lae: &LdapAuthEvent,
@@ -846,28 +940,45 @@ impl<'a> IdmServerAuthTransaction<'a> {
                 return Ok(None);
             }
 
-            let _softlock_ticket = self.softlock_ticket.acquire().await;
-            let mut softlock_write = self.softlocks.write();
-
-            let cred_uuid = account.unix_cred_uuid();
-            let is_valid = if let Some(cu) = cred_uuid.as_ref() {
-                // Advanced and then check the softlock.
-                softlock_write
-                    .get_mut(cu)
-                    .map(|slock| {
-                        // Apply the current time.
-                        slock.apply_time_step(ct);
-                        // Now check the results
-                        slock.is_valid()
-                    })
-                    // No sl, it's valid.
-                    .unwrap_or(true)
-            } else {
-                // No cred id? It'll fail in verify ...
-                true
+            let maybe_slock_ref = match account.unix_cred_uuid_and_policy() {
+                Some((cred_uuid, policy)) => {
+                    let softlock_read = self.softlocks.read();
+                    let slock_ref = match softlock_read.get(&cred_uuid) {
+                        Some(slock_ref) => slock_ref.clone(),
+                        None => {
+                            let _session_ticket = self.session_ticket.acquire().await;
+                            let mut softlock_write = self.softlocks.write();
+                            let slock = Arc::new(Mutex::new(CredSoftLock::new(policy)));
+                            softlock_write.insert(cred_uuid, slock.clone());
+                            softlock_write.commit();
+                            slock
+                        }
+                    };
+                    Some(slock_ref)
+                }
+                None => None,
             };
 
-            let res = if is_valid {
+            let maybe_slock = if let Some(s) = maybe_slock_ref.as_ref() {
+                Some(s.lock().await)
+            } else {
+                None
+            };
+
+            let maybe_valid = if let Some(mut slock) = maybe_slock {
+                // Apply the current time.
+                slock.apply_time_step(ct);
+                // Now check the results
+                if slock.is_valid() {
+                    Some(slock)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let res = if let Some(mut slock) = maybe_valid {
                 if account
                     .verify_unix_credential(lae.cleartext.as_str(), &self.async_tx, ct)?
                     .is_some()
@@ -904,17 +1015,7 @@ impl<'a> IdmServerAuthTransaction<'a> {
                     }))
                 } else {
                     // PW failure, update softlock.
-                    if let Some(cu) = cred_uuid.as_ref() {
-                        // Update the cred failure.
-                        if let Some(slock) = softlock_write.get_mut(cu) {
-                            // Update it.
-                            slock.record_failure(ct);
-                        } else if let Some(policy) = account.unix_cred_softlock_policy() {
-                            let mut slock = CredSoftLock::new(policy);
-                            slock.record_failure(ct);
-                            softlock_write.insert(*cu, slock);
-                        };
-                    };
+                    slock.record_failure(ct);
                     Ok(None)
                 }
             } else {
@@ -922,8 +1023,6 @@ impl<'a> IdmServerAuthTransaction<'a> {
                 security_info!("Account is softlocked.");
                 Ok(None)
             };
-
-            softlock_write.commit();
             res
         }
     }
@@ -945,13 +1044,12 @@ impl<'a> IdmServerTransaction<'a> for IdmServerProxyReadTransaction<'a> {
         &self.qs_read
     }
 
-    fn get_uat_bundy_txn(&self) -> &HS512 {
-        &*self.uat_bundy_hmac
+    fn get_uat_validator_txn(&self) -> &JwsValidator {
+        &*self.uat_jwt_validator
     }
 }
 
 impl<'a> IdmServerProxyReadTransaction<'a> {
-    // TODO: tracing
     pub fn get_radiusauthtoken(
         &mut self,
         rate: &RadiusAuthTokenEvent,
@@ -971,7 +1069,6 @@ impl<'a> IdmServerProxyReadTransaction<'a> {
         account.to_radiusauthtoken(ct)
     }
 
-    // TODO: tracing
     pub fn get_unixusertoken(
         &mut self,
         uute: &UnixUserTokenEvent,
@@ -991,7 +1088,6 @@ impl<'a> IdmServerProxyReadTransaction<'a> {
         account.to_unixusertoken(ct)
     }
 
-    // TODO: tracing
     pub fn get_unixgrouptoken(
         &mut self,
         uute: &UnixGroupTokenEvent,
@@ -1007,7 +1103,6 @@ impl<'a> IdmServerProxyReadTransaction<'a> {
         group.to_unixgrouptoken()
     }
 
-    // TODO: tracing
     pub fn get_credentialstatus(
         &mut self,
         cse: &CredentialStatusEvent,
@@ -1026,7 +1121,6 @@ impl<'a> IdmServerProxyReadTransaction<'a> {
         account.to_credentialstatus()
     }
 
-    // TODO: tracing
     pub fn get_backup_codes(
         &mut self,
         rbce: &ReadBackupCodeEvent,
@@ -1067,14 +1161,56 @@ impl<'a> IdmServerProxyReadTransaction<'a> {
             .check_oauth2_authorise_permit(ident, uat, consent_req, ct)
     }
 
+    pub fn check_oauth2_authorise_reject(
+        &self,
+        ident: &Identity,
+        uat: &UserAuthToken,
+        consent_req: &str,
+        ct: Duration,
+    ) -> Result<Url, OperationError> {
+        self.oauth2rs
+            .check_oauth2_authorise_reject(ident, uat, consent_req, ct)
+    }
+
     pub fn check_oauth2_token_exchange(
         &self,
-        client_authz: &str,
+        client_authz: Option<&str>,
         token_req: &AccessTokenRequest,
         ct: Duration,
     ) -> Result<AccessTokenResponse, Oauth2Error> {
         self.oauth2rs
             .check_oauth2_token_exchange(client_authz, token_req, ct)
+    }
+
+    pub fn check_oauth2_token_introspect(
+        &self,
+        client_authz: &str,
+        intr_req: &AccessTokenIntrospectRequest,
+        ct: Duration,
+    ) -> Result<AccessTokenIntrospectResponse, Oauth2Error> {
+        self.oauth2rs
+            .check_oauth2_token_introspect(self, client_authz, intr_req, ct)
+    }
+
+    pub fn oauth2_openid_userinfo(
+        &self,
+        client_id: &str,
+        client_authz: &str,
+        ct: Duration,
+    ) -> Result<OidcToken, Oauth2Error> {
+        self.oauth2rs
+            .oauth2_openid_userinfo(self, client_id, client_authz, ct)
+    }
+
+    pub fn oauth2_openid_discovery(
+        &self,
+        client_id: &str,
+    ) -> Result<OidcDiscoveryResponse, OperationError> {
+        self.oauth2rs.oauth2_openid_discovery(client_id)
+    }
+
+    pub fn oauth2_openid_publickey(&self, client_id: &str) -> Result<JwkKeySet, OperationError> {
+        self.oauth2rs.oauth2_openid_publickey(client_id)
     }
 }
 
@@ -1085,8 +1221,8 @@ impl<'a> IdmServerTransaction<'a> for IdmServerProxyWriteTransaction<'a> {
         &self.qs_write
     }
 
-    fn get_uat_bundy_txn(&self) -> &HS512 {
-        &*self.uat_bundy_hmac
+    fn get_uat_validator_txn(&self) -> &JwsValidator {
+        &*self.uat_jwt_validator
     }
 }
 
@@ -1100,7 +1236,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         // expired will now be dropped, and can't be used by future sessions.
     }
 
-    // TODO: tracing
     fn check_password_quality(
         &mut self,
         cleartext: &str,
@@ -1224,18 +1359,8 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
 
         // Check the password quality.
         // Ask if tis all good - this step checks pwpolicy and such
-        // Get related inputs, such as account name, email, etc.
-        let mut related_inputs: Vec<&str> = vec![
-            account.name.as_str(),
-            account.displayname.as_str(),
-            account.spn.as_str(),
-        ];
 
-        if let Some(s) = account.radius_secret.as_ref() {
-            related_inputs.push(s.as_str())
-        };
-
-        self.check_password_quality(pce.cleartext.as_str(), related_inputs.as_slice())
+        self.check_password_quality(pce.cleartext.as_str(), account.related_inputs().as_slice())
             .map_err(|e| {
                 request_error!(err = ?e, "check_password_quality");
                 e
@@ -1311,18 +1436,7 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         // If we got here, then pre-apply succedded, and that means access control
         // passed. Now we can do the extra checks.
 
-        // Get related inputs, such as account name, email, etc.
-        let mut related_inputs: Vec<&str> = vec![
-            account.name.as_str(),
-            account.displayname.as_str(),
-            account.spn.as_str(),
-        ];
-
-        if let Some(s) = account.radius_secret.as_ref() {
-            related_inputs.push(s.as_str())
-        };
-
-        self.check_password_quality(pce.cleartext.as_str(), related_inputs.as_slice())
+        self.check_password_quality(pce.cleartext.as_str(), account.related_inputs().as_slice())
             .map_err(|e| {
                 admin_error!(?e, "Failed to checked password quality");
                 e
@@ -1337,7 +1451,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         Ok(())
     }
 
-    // TODO: tracing
     pub fn recover_account(
         &mut self,
         name: &str,
@@ -1377,7 +1490,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         Ok(cleartext)
     }
 
-    // TODO: tracing
     pub fn generate_account_password(
         &mut self,
         gpe: &GeneratePasswordEvent,
@@ -1420,7 +1532,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
             })
     }
 
-    // TODO: tracing
     /// Generate a new set of backup code and remove the old ones.
     pub fn generate_backup_code(
         &mut self,
@@ -1459,7 +1570,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
             })
     }
 
-    // TODO: tracing
     pub fn remove_backup_code(
         &mut self,
         rte: &RemoveBackupCodeEvent,
@@ -1488,7 +1598,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
             .map(|_| SetCredentialResponse::Success)
     }
 
-    // TODO: tracing
     pub fn regenerate_radius_secret(
         &mut self,
         rrse: &RegenerateRadiusSecretEvent,
@@ -1526,7 +1635,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
             .map(|_| cleartext)
     }
 
-    // TODO: tracing
     pub fn reg_account_webauthn_init(
         &mut self,
         wre: &WebauthnInitRegisterEvent,
@@ -1548,7 +1656,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         Ok(next)
     }
 
-    // TODO: tracing
     pub fn reg_account_webauthn_complete(
         &mut self,
         wre: &WebauthnDoRegisterEvent,
@@ -1601,7 +1708,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         Ok(next)
     }
 
-    // TODO: tracing
     pub fn remove_account_webauthn(
         &mut self,
         rwe: &RemoveWebauthnEvent,
@@ -1636,7 +1742,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
             .map(|_| SetCredentialResponse::Success)
     }
 
-    // TODO: tracing
     pub fn generate_account_totp(
         &mut self,
         gte: &GenerateTotpEvent,
@@ -1659,7 +1764,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         Ok(next)
     }
 
-    // TODO: tracing
     pub fn verify_account_totp(
         &mut self,
         vte: &VerifyTotpEvent,
@@ -1716,7 +1820,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         Ok(next)
     }
 
-    // TODO: tracing
     pub fn accept_account_sha1_totp(
         &mut self,
         aste: &AcceptSha1TotpEvent,
@@ -1771,7 +1874,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         Ok(next)
     }
 
-    // TODO: tracing
     pub fn remove_account_totp(
         &mut self,
         rte: &RemoveTotpEvent,
@@ -1800,7 +1902,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
             .map(|_| SetCredentialResponse::Success)
     }
 
-    // TODO: tracing
     // -- delayed action processing --
     fn process_pwupgrade(&mut self, pwu: &PasswordUpgrade) -> Result<(), OperationError> {
         // get the account
@@ -1828,7 +1929,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         }
     }
 
-    // TODO: tracing
     fn process_unixpwupgrade(&mut self, pwu: &UnixPasswordUpgrade) -> Result<(), OperationError> {
         let account = self
             .qs_write
@@ -1860,7 +1960,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         }
     }
 
-    // TODO: tracing
     pub(crate) fn process_webauthncounterinc(
         &mut self,
         wci: &WebauthnCounterIncrement,
@@ -1887,7 +1986,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         }
     }
 
-    // TODO: tracing
     pub(crate) fn process_backupcoderemoval(
         &mut self,
         bcr: &BackupCodeRemoval,
@@ -1907,7 +2005,6 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
         )
     }
 
-    // TODO: tracing
     pub(crate) fn process_delayedaction(
         &mut self,
         da: DelayedAction,
@@ -1937,20 +2034,43 @@ impl<'a> IdmServerProxyWriteTransaction<'a> {
             if self.qs_write.get_changed_domain() {
                 // reload token_key?
                 self.qs_write
-                    .get_domain_token_key()
+                    .get_domain_fernet_private_key()
                     .and_then(|token_key| {
-                        HS512::from_str(&token_key).map_err(|e| {
-                            admin_error!("Failed to generate uat_bundy_hmac - {:?}", e);
+                        Fernet::new(&token_key).ok_or_else(|| {
+                            admin_error!("Failed to generate token_enc_key");
                             OperationError::InvalidState
                         })
                     })
                     .map(|new_handle| {
-                        *self.uat_bundy_hmac = new_handle;
+                        *self.token_enc_key = new_handle;
+                    })?;
+                self.qs_write
+                    .get_domain_es256_private_key()
+                    .and_then(|key_der| {
+                        JwsSigner::from_es256_der(&key_der).map_err(|e| {
+                            admin_error!("Failed to generate uat_jwt_signer - {:?}", e);
+                            OperationError::InvalidState
+                        })
+                    })
+                    .and_then(|signer| {
+                        signer
+                            .get_validator()
+                            .map_err(|e| {
+                                admin_error!("Failed to generate uat_jwt_validator - {:?}", e);
+                                OperationError::InvalidState
+                            })
+                            .map(|validator| (signer, validator))
+                    })
+                    .map(|(new_signer, new_validator)| {
+                        *self.uat_jwt_signer = new_signer;
+                        *self.uat_jwt_validator = new_validator;
                     })?;
             }
             // Commit everything.
             self.oauth2rs.commit();
-            self.uat_bundy_hmac.commit();
+            self.uat_jwt_signer.commit();
+            self.uat_jwt_validator.commit();
+            self.token_enc_key.commit();
             self.pw_badlist_cache.commit();
             self.mfareg_sessions.commit();
             self.qs_write.commit()
@@ -3829,11 +3949,21 @@ mod tests {
 
                 // Now reset the token_key - we can cheat and push this
                 // through the migrate 3 to 4 code.
+                //
+                // fernet_private_key_str
+                // es256_private_key_der
                 let idms_prox_write = idms.proxy_write(ct.clone());
-                idms_prox_write
-                    .qs_write
-                    .migrate_3_to_4()
-                    .expect("Failed to reset domain token key");
+                let me_reset_tokens = unsafe {
+                    ModifyEvent::new_internal_invalid(
+                        filter!(f_eq("uuid", PartialValue::new_uuidr(&UUID_DOMAIN_INFO))),
+                        ModifyList::new_list(vec![
+                            Modify::Purged(AttrString::from("fernet_private_key_str")),
+                            Modify::Purged(AttrString::from("es256_private_key_der")),
+                            Modify::Purged(AttrString::from("domain_token_key")),
+                        ]),
+                    )
+                };
+                assert!(idms_prox_write.qs_write.modify(&me_reset_tokens).is_ok());
                 assert!(idms_prox_write.commit().is_ok());
                 // Check the old token is invalid, due to reload.
                 let new_token = check_admin_password(idms, TEST_PASSWORD);

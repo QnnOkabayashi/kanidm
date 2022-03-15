@@ -15,6 +15,7 @@ use tracing::dispatcher::SetGlobalDefaultError;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Record};
 use tracing::{Event, Id, Level, Metadata, Subscriber};
+use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::layer::{Context, Layered, SubscriberExt};
 use tracing_subscriber::registry::{LookupSpan, Registry, Scope, SpanRef};
 use tracing_subscriber::Layer;
@@ -224,7 +225,7 @@ impl<P: Processor> TreeLayer<P> {
 }
 
 impl<P: Processor> Layer<Registry> for TreeLayer<P> {
-    fn new_span(&self, attrs: &Attributes, id: &Id, ctx: Context<Registry>) {
+    fn on_new_span(&self, attrs: &Attributes, id: &Id, ctx: Context<Registry>) {
         #[allow(clippy::expect_used)]
         let span = ctx.span(id).expect("Span not found, this is a bug");
 
@@ -395,8 +396,8 @@ impl TreeEvent {
             .map(EventTag::emoji)
             .unwrap_or_else(|| match self.level {
                 Level::ERROR => "🚨",
-                Level::WARN => "🚧",
-                Level::INFO => "💬",
+                Level::WARN => "⚠️ ",
+                Level::INFO => "  ",
                 Level::DEBUG => "🐛",
                 Level::TRACE => "📍",
             })
@@ -538,6 +539,11 @@ pub fn operation_id() -> Option<Uuid> {
 
 pub fn main_init() -> JoinHandle<()> {
     let (subscriber, logger) = TreeSubscriber::pretty();
+    #[allow(clippy::expect_used)]
+    let subscriber = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new("info"))
+        .expect("Failed to init envfilter")
+        .with_subscriber(subscriber);
     #[allow(clippy::expect_used)]
     tracing::subscriber::set_global_default(subscriber)
         .expect("🚨🚨🚨 Global subscriber already set, this is a bug 🚨🚨🚨");

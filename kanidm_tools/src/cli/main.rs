@@ -1,5 +1,7 @@
 #![deny(warnings)]
 #![warn(unused_extern_crates)]
+#![deny(clippy::todo)]
+#![deny(clippy::unimplemented)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
@@ -19,10 +21,8 @@ fn main() {
             "RUST_LOG",
             "kanidm=debug,kanidm_client=debug,webauthn=debug",
         );
-    } else {
-        ::std::env::set_var("RUST_LOG", "kanidm=info,kanidm_client=info,webauthn=info");
     }
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
     opt.exec()
 }

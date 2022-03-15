@@ -1,12 +1,12 @@
 use crate::be::dbvalue::DbBackupCodeV1;
 use crate::be::dbvalue::{DbCredTypeV1, DbCredV1, DbPasswordV1, DbWebauthnV1};
 use hashbrown::HashMap as Map;
+use hashbrown::HashSet;
 use kanidm_proto::v1::{BackupCodesView, CredentialDetail, CredentialDetailType, OperationError};
 use openssl::hash::MessageDigest;
 use openssl::pkcs5::pbkdf2_hmac;
 use openssl::sha::Sha512;
 use rand::prelude::*;
-use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -269,7 +269,7 @@ pub struct Credential {
 }
 
 #[derive(Clone, Debug)]
-/// The typo of credential that is stored. Each of these represents a full set of 'what is required'
+/// The type of credential that is stored. Each of these represents a full set of 'what is required'
 /// to complete an authentication session. The reason to have these typed like this is so we can
 /// apply policy later to what classes or levels of credentials can be used. We use these types
 /// to also know what type of auth session handler to initiate.
@@ -289,12 +289,12 @@ pub enum CredentialType {
     // PasswordWebauthnVerified(Password, Map<String, WebauthnCredential>),
 }
 
-impl Into<CredentialDetail> for &Credential {
-    fn into(self) -> CredentialDetail {
+impl From<&Credential> for CredentialDetail {
+    fn from(value: &Credential) -> Self {
         CredentialDetail {
-            uuid: self.uuid,
-            claims: self.claims.clone(),
-            type_: match &self.type_ {
+            uuid: value.uuid,
+            claims: value.claims.clone(),
+            type_: match &value.type_ {
                 CredentialType::Password(_) => CredentialDetailType::Password,
                 CredentialType::GeneratedPassword(_) => CredentialDetailType::GeneratedPassword,
                 CredentialType::Webauthn(wan) => {
@@ -755,22 +755,22 @@ impl Credential {
         }
     }
 
-    pub(crate) fn softlock_policy(&self) -> Option<CredSoftLockPolicy> {
+    pub(crate) fn softlock_policy(&self) -> CredSoftLockPolicy {
         match &self.type_ {
             CredentialType::Password(_pw) | CredentialType::GeneratedPassword(_pw) => {
-                Some(CredSoftLockPolicy::Password)
+                CredSoftLockPolicy::Password
             }
             CredentialType::PasswordMfa(_pw, totp, wan, _) => {
                 // For backup code, use totp/wan policy (whatever is available)
                 if let Some(r_totp) = totp {
-                    Some(CredSoftLockPolicy::Totp(r_totp.step))
+                    CredSoftLockPolicy::Totp(r_totp.step)
                 } else if !wan.is_empty() {
-                    Some(CredSoftLockPolicy::Webauthn)
+                    CredSoftLockPolicy::Webauthn
                 } else {
-                    None
+                    CredSoftLockPolicy::Password
                 }
             }
-            CredentialType::Webauthn(_wan) => Some(CredSoftLockPolicy::Webauthn),
+            CredentialType::Webauthn(_wan) => CredSoftLockPolicy::Webauthn,
         }
     }
 

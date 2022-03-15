@@ -23,11 +23,8 @@ use kanidm_proto::v1::{ConsistencyError, OperationError, SchemaError};
 use tracing::trace;
 
 use hashbrown::{HashMap, HashSet};
-use std::borrow::Borrow;
-// use std::collections::BTreeSet;
 use uuid::Uuid;
 
-// use concread::cowcell::asynch::*;
 use concread::cowcell::*;
 
 // representations of schema that confines object types, classes
@@ -198,29 +195,55 @@ impl SchemaAttribute {
             SyntaxType::Url => v.is_url(),
             SyntaxType::OauthScope => v.is_oauthscope(),
             SyntaxType::OauthScopeMap => v.is_oauthscopemap() || v.is_refer(),
+            SyntaxType::PrivateBinary => v.is_privatebinary(),
         };
         if r {
             Ok(())
-        } else {
-            trace!(?a, ?self, ?v, "validate_pv InvalidAttributeSyntax");
-            Err(SchemaError::InvalidAttributeSyntax(a.to_string()))
-        }
-    }
-
-    pub fn validate_value(&self, a: &str, v: &Value) -> Result<(), SchemaError> {
-        let r = v.validate();
-        if cfg!(test) {
-            assert!(r);
-        }
-        if r {
-            let pv: &PartialValue = v.borrow();
-            self.validate_partialvalue(a, pv)
         } else {
             trace!(
                 ?a,
                 ?self,
                 ?v,
-                "value validation failure - InvalidAttributeSyntax"
+                "validate_partialvalue InvalidAttributeSyntax"
+            );
+            Err(SchemaError::InvalidAttributeSyntax(a.to_string()))
+        }
+    }
+
+    pub fn validate_value(&self, a: &str, v: &Value) -> Result<(), SchemaError> {
+        let r = v.validate()
+            && match self.syntax {
+                SyntaxType::Boolean => v.is_bool(),
+                SyntaxType::SYNTAX_ID => v.is_syntax(),
+                SyntaxType::INDEX_ID => v.is_index(),
+                SyntaxType::Uuid => v.is_uuid(),
+                SyntaxType::REFERENCE_UUID => v.is_refer(),
+                SyntaxType::Utf8StringInsensitive => v.is_iutf8(),
+                SyntaxType::Utf8StringIname => v.is_iname(),
+                SyntaxType::UTF8STRING => v.is_utf8(),
+                SyntaxType::JSON_FILTER => v.is_json_filter(),
+                SyntaxType::Credential => v.is_credential(),
+                SyntaxType::SecretUtf8String => v.is_secret_string(),
+                SyntaxType::SshKey => v.is_sshkey(),
+                SyntaxType::SecurityPrincipalName => v.is_spn(),
+                SyntaxType::UINT32 => v.is_uint32(),
+                SyntaxType::Cid => v.is_cid(),
+                SyntaxType::NsUniqueId => v.is_nsuniqueid(),
+                SyntaxType::DateTime => v.is_datetime(),
+                SyntaxType::EmailAddress => v.is_email_address(),
+                SyntaxType::Url => v.is_url(),
+                SyntaxType::OauthScope => v.is_oauthscope(),
+                SyntaxType::OauthScopeMap => v.is_oauthscopemap() || v.is_refer(),
+                SyntaxType::PrivateBinary => v.is_privatebinary(),
+            };
+        if r {
+            Ok(())
+        } else {
+            trace!(
+                ?a,
+                ?self,
+                ?v,
+                "validate_value failure - InvalidAttributeSyntax"
             );
             Err(SchemaError::InvalidAttributeSyntax(a.to_string()))
         }
@@ -257,8 +280,9 @@ impl SchemaAttribute {
             SyntaxType::Url => ava.is_url(),
             SyntaxType::OauthScope => ava.is_oauthscope(),
             SyntaxType::OauthScopeMap => ava.is_oauthscopemap(),
+            SyntaxType::PrivateBinary => ava.is_privatebinary(),
         };
-        if valid {
+        if valid && ava.validate() {
             Ok(())
         } else {
             admin_error!(?a, "validate_ava - InvalidAttributeSyntax");
@@ -517,7 +541,7 @@ impl<'a> SchemaWriteTransaction<'a> {
         r
     }
 
-    pub(crate) fn reload_idxmeta(&self) -> Vec<IdxKey> {
+    pub fn reload_idxmeta(&self) -> Vec<IdxKey> {
         self.get_attributes()
             .values()
             .flat_map(|a| {

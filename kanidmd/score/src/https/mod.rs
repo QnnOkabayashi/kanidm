@@ -4,11 +4,11 @@ mod v1;
 use self::oauth2::*;
 use self::v1::*;
 
-use crate::actors::v1_read::QueryServerReadV1;
-use crate::actors::v1_write::QueryServerWriteV1;
-use crate::config::{ServerRole, TlsConfiguration};
-use crate::prelude::*;
-use crate::status::StatusActor;
+use kanidm::actors::v1_read::QueryServerReadV1;
+use kanidm::actors::v1_write::QueryServerWriteV1;
+use kanidm::config::{ServerRole, TlsConfiguration};
+use kanidm::prelude::*;
+use kanidm::status::StatusActor;
 
 use serde::Serialize;
 use std::path::PathBuf;
@@ -17,8 +17,10 @@ use uuid::Uuid;
 
 use tide_openssl::TlsListener;
 
-use crate::tracing_tree::TreeMiddleware;
+use kanidm::tracing_tree::TreeMiddleware;
 use tracing::{error, info};
+
+use compact_jwt::{Jws, JwsSigner, JwsUnverified, JwsValidator};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -26,7 +28,8 @@ pub struct AppState {
     pub qe_w_ref: &'static QueryServerWriteV1,
     pub qe_r_ref: &'static QueryServerReadV1,
     // Store the token management parts.
-    pub bundy_handle: std::sync::Arc<bundy::hs512::HS512>,
+    pub jws_signer: std::sync::Arc<JwsSigner>,
+    pub jws_validator: std::sync::Arc<JwsValidator>,
 }
 
 pub trait RequestExtensions {
@@ -69,7 +72,7 @@ impl RequestExtensions for tide::Request<AppState> {
 
     fn get_current_auth_session_id(&self) -> Option<Uuid> {
         // We see if there is a signed header copy first.
-        let kref = &self.state().bundy_handle;
+        let kref = &self.state().jws_validator;
         self.header("X-KANIDM-AUTH-SESSION-ID")
             .and_then(|hv| {
                 // Get the first header value.
@@ -78,8 +81,12 @@ impl RequestExtensions for tide::Request<AppState> {
             .and_then(|h| {
                 // Take the token str and attempt to decrypt
                 // Attempt to re-inflate a uuid from bytes.
-                let uat: Option<Uuid> = kref.verify(h.as_str()).ok();
-                uat
+                JwsUnverified::from_str(h.as_str()).ok()
+            })
+            .and_then(|jwsu| {
+                jwsu.validate(kref)
+                    .map(|jws: Jws<SessionId>| jws.inner.sessionid)
+                    .ok()
             })
             // If not there, get from the cookie instead.
             .or_else(|| self.session().get::<Uuid>("auth-session-id"))
@@ -92,7 +99,7 @@ impl RequestExtensions for tide::Request<AppState> {
     }
 
     fn new_eventid(&self) -> (Uuid, String) {
-        let eventid = Uuid::new_v4();
+        let eventid = kanidm::tracing_tree::operation_id().unwrap();
         let hv = eventid.to_hyphenated().to_string();
         (eventid, hv)
     }
@@ -111,20 +118,24 @@ pub fn to_tide_response<T: Serialize>(
             })
         }
         Err(e) => {
-            let sc = match &e {
+            let mut res = match &e {
                 OperationError::NotAuthenticated | OperationError::SessionExpired => {
-                    tide::StatusCode::Unauthorized
+                    // https://datatracker.ietf.org/doc/html/rfc7235#section-4.1
+                    let mut res = tide::Response::new(tide::StatusCode::Unauthorized);
+                    res.insert_header("WWW-Authenticate", "Bearer");
+                    res
                 }
                 OperationError::SystemProtectedObject | OperationError::AccessDenied => {
-                    tide::StatusCode::Forbidden
+                    tide::Response::new(tide::StatusCode::Forbidden)
                 }
-                OperationError::NoMatchingEntries => tide::StatusCode::NotFound,
+                OperationError::NoMatchingEntries => {
+                    tide::Response::new(tide::StatusCode::NotFound)
+                }
                 OperationError::EmptyRequest | OperationError::SchemaViolation(_) => {
-                    tide::StatusCode::BadRequest
+                    tide::Response::new(tide::StatusCode::BadRequest)
                 }
-                _ => tide::StatusCode::InternalServerError,
+                _ => tide::Response::new(tide::StatusCode::InternalServerError),
             };
-            let mut res = tide::Response::new(sc);
             tide::Body::from_json(&e).map(|b| {
                 res.set_body(b);
                 res
@@ -146,13 +157,23 @@ async fn index_view(_req: tide::Request<AppState>) -> tide::Result {
 <!DOCTYPE html>
 <html>
     <head>
-        <meta charset="utf-8">
+        <meta charset="utf-8"/>
         <title>Kanidm</title>
-        <script src="/pkg/bundle.js" defer></script>
-        <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦀</text></svg>">
+        <link rel="stylesheet" href="/pkg/external/bootstrap.min.css" integrity="sha384-EVSTQN3/azprG1Anm3QDgpJLIm9Nao0Yz1ztcQTwFspd3yD65VohhpuuCOmLASjC"/>
+        <link rel="stylesheet" href="/pkg/style.css"/>
+        <script src="/pkg/external/bootstrap.bundle.min.js" integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM"></script>
+        <script src="/pkg/external/confetti.js"></script>
+        <script type="module" defer>
+            import init, { run_app } from '/pkg/kanidmd_web_ui.js';
+            async function main() {
+               await init('/pkg/kanidmd_web_ui_bg.wasm');
+               run_app();
+            }
+            main()
+        </script>
 
+        <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦀</text></svg>" />
     </head>
-
     <body>
     </body>
 </html>
@@ -162,13 +183,8 @@ async fn index_view(_req: tide::Request<AppState>) -> tide::Result {
     Ok(res)
 }
 
+#[derive(Default)]
 struct NoCacheMiddleware;
-
-impl Default for NoCacheMiddleware {
-    fn default() -> Self {
-        NoCacheMiddleware {}
-    }
-}
 
 #[async_trait::async_trait]
 impl<State: Clone + Send + Sync + 'static> tide::Middleware<State> for NoCacheMiddleware {
@@ -184,13 +200,8 @@ impl<State: Clone + Send + Sync + 'static> tide::Middleware<State> for NoCacheMi
     }
 }
 
+#[derive(Default)]
 struct CacheableMiddleware;
-
-impl Default for CacheableMiddleware {
-    fn default() -> Self {
-        CacheableMiddleware {}
-    }
-}
 
 #[async_trait::async_trait]
 impl<State: Clone + Send + Sync + 'static> tide::Middleware<State> for CacheableMiddleware {
@@ -205,13 +216,8 @@ impl<State: Clone + Send + Sync + 'static> tide::Middleware<State> for Cacheable
     }
 }
 
+#[derive(Default)]
 struct StaticContentMiddleware;
-
-impl Default for StaticContentMiddleware {
-    fn default() -> Self {
-        StaticContentMiddleware {}
-    }
-}
 
 #[async_trait::async_trait]
 impl<State: Clone + Send + Sync + 'static> tide::Middleware<State> for StaticContentMiddleware {
@@ -226,13 +232,8 @@ impl<State: Clone + Send + Sync + 'static> tide::Middleware<State> for StaticCon
     }
 }
 
+#[derive(Default)]
 struct StrictResponseMiddleware;
-
-impl Default for StrictResponseMiddleware {
-    fn default() -> Self {
-        StrictResponseMiddleware {}
-    }
-}
 
 #[async_trait::async_trait]
 impl<State: Clone + Send + Sync + 'static> tide::Middleware<State> for StrictResponseMiddleware {
@@ -295,24 +296,26 @@ pub fn create_https_server(
     opt_tls_params: Option<&TlsConfiguration>,
     role: ServerRole,
     cookie_key: &[u8; 32],
-    bundy_key: &str,
+    jws_signer: JwsSigner,
     status_ref: &'static StatusActor,
     qe_w_ref: &'static QueryServerWriteV1,
     qe_r_ref: &'static QueryServerReadV1,
 ) -> Result<(), ()> {
     info!("WEB_UI_PKG_PATH -> {}", env!("KANIDM_WEB_UI_PKG_PATH"));
 
-    let bundy_handle = bundy::hs512::HS512::from_str(bundy_key).map_err(|e| {
-        error!(?e, "Failed to generate bundy handle");
+    let jws_validator = jws_signer.get_validator().map_err(|e| {
+        error!(?e, "Failed to get jws validator");
     })?;
 
-    let bundy_handle = std::sync::Arc::new(bundy_handle);
+    let jws_validator = std::sync::Arc::new(jws_validator);
+    let jws_signer = std::sync::Arc::new(jws_signer);
 
     let mut tserver = tide::Server::with_state(AppState {
         status_ref,
         qe_w_ref,
         qe_r_ref,
-        bundy_handle,
+        jws_signer,
+        jws_validator,
     });
 
     // tide::log::with_level(tide::log::LevelFilter::Debug);
@@ -377,33 +380,58 @@ pub fn create_https_server(
         .get(account_get_id_unix_token);
 
     // ==== These routes can not be cached
-
     let mut appserver = tserver.at("");
     appserver.with(NoCacheMiddleware::default());
 
-    let mut well_known = appserver.at("/.well-known");
-    well_known
-        .at("/openid-configuration")
-        .get(get_openid_configuration);
+    // let mut well_known = appserver.at("/.well-known");
 
     appserver.at("/status").get(self::status);
     // == oauth endpoints.
 
     let mut oauth2_process = appserver.at("/oauth2");
+    // ⚠️  ⚠️   WARNING  ⚠️  ⚠️
+    // IF YOU CHANGE THESE VALUES YOU MUST UPDATE OIDC DISCOVERY URLS
     oauth2_process
         .at("/authorise")
         .post(oauth2_authorise_post)
         .get(oauth2_authorise_get);
+    // ⚠️  ⚠️   WARNING  ⚠️  ⚠️
+    // IF YOU CHANGE THESE VALUES YOU MUST UPDATE OIDC DISCOVERY URLS
     oauth2_process
         .at("/authorise/permit")
         .post(oauth2_authorise_permit_post)
         .get(oauth2_authorise_permit_get);
+    // ⚠️  ⚠️   WARNING  ⚠️  ⚠️
+    // IF YOU CHANGE THESE VALUES YOU MUST UPDATE OIDC DISCOVERY URLS
+    oauth2_process
+        .at("/authorise/reject")
+        .post(oauth2_authorise_reject_post)
+        .get(oauth2_authorise_reject_get);
+    // ⚠️  ⚠️   WARNING  ⚠️  ⚠️
+    // IF YOU CHANGE THESE VALUES YOU MUST UPDATE OIDC DISCOVERY URLS
     oauth2_process.at("/token").post(oauth2_token_post);
-    /*
+    // ⚠️  ⚠️   WARNING  ⚠️  ⚠️
+    // IF YOU CHANGE THESE VALUES YOU MUST UPDATE OIDC DISCOVERY URLS
     oauth2_process
         .at("/token/introspect")
-        .get(oauth2_token_introspect_get);
-    */
+        .post(oauth2_token_introspect_post);
+
+    let mut openid_process = appserver.at("/oauth2/openid");
+    // ⚠️  ⚠️   WARNING  ⚠️  ⚠️
+    // IF YOU CHANGE THESE VALUES YOU MUST UPDATE OIDC DISCOVERY URLS
+    openid_process
+        .at("/:client_id/.well-known/openid-configuration")
+        .get(oauth2_openid_discovery_get);
+    // ⚠️  ⚠️   WARNING  ⚠️  ⚠️
+    // IF YOU CHANGE THESE VALUES YOU MUST UPDATE OIDC DISCOVERY URLS
+    openid_process
+        .at("/:client_id/userinfo")
+        .get(oauth2_openid_userinfo_get);
+    // ⚠️  ⚠️   WARNING  ⚠️  ⚠️
+    // IF YOU CHANGE THESE VALUES YOU MUST UPDATE OIDC DISCOVERY URLS
+    openid_process
+        .at("/:client_id/public_key.jwk")
+        .get(oauth2_openid_publickey_get);
 
     let mut raw_route = appserver.at("/v1/raw");
     raw_route.at("/create").post(create);

@@ -8,8 +8,9 @@ use crate::plugins::Plugin;
 
 use crate::event::{CreateEvent, ModifyEvent};
 use crate::prelude::*;
-use bundy::hs512::HS512;
+use compact_jwt::JwsSigner;
 use kanidm_proto::v1::OperationError;
+use std::iter::once;
 use tracing::trace;
 
 lazy_static! {
@@ -35,23 +36,30 @@ impl Plugin for Domain {
             {
                 // We always set this, because the DB uuid is authorative.
                 let u = Value::new_uuid(qs.get_domain_uuid());
-                e.set_ava("domain_uuid", btreeset![u]);
+                e.set_ava("domain_uuid", once(u));
                 trace!("plugin_domain: Applying uuid transform");
                 // We only apply this if one isn't provided.
                 if !e.attribute_pres("domain_name") {
-                    let n = Value::new_iname("example.com");
-                    e.set_ava("domain_name", btreeset![n]);
+                    let n = Value::new_iname(qs.get_domain_name());
+                    e.set_ava("domain_name", once(n));
                     trace!("plugin_domain: Applying domain_name transform");
                 }
-                if !e.attribute_pres("domain_token_key") {
-                    let k = HS512::generate_key()
-                        .map(|k| Value::new_secret_str(&k))
+                if !e.attribute_pres("fernet_private_key_str") {
+                    security_info!("regenerating domain token encryption key");
+                    let k = fernet::Fernet::generate_key();
+                    let v = Value::new_secret_str(&k);
+                    e.add_ava("fernet_private_key_str", v);
+                }
+                if !e.attribute_pres("es256_private_key_der") {
+                    security_info!("regenerating domain es256 private key");
+                    let der = JwsSigner::generate_es256()
+                        .and_then(|jws| jws.private_key_to_der())
                         .map_err(|e| {
-                            admin_error!(err = ?e, "Failed to generate domain_token_key");
-                            OperationError::InvalidState
+                            admin_error!(err = ?e, "Unable to generate ES256 JwsSigner private key");
+                            OperationError::CryptographyError
                         })?;
-                    e.set_ava("domain_token_key", btreeset![k]);
-                    trace!("plugin_domain: Applying domain_token_key transform");
+                    let v = Value::new_privatebinary(&der);
+                    e.add_ava("es256_private_key_der", v);
                 }
                 trace!(?e);
                 Ok(())
@@ -70,15 +78,22 @@ impl Plugin for Domain {
             if e.attribute_equality("class", &PVCLASS_DOMAIN_INFO)
                 && e.attribute_equality("uuid", &PVUUID_DOMAIN_INFO)
             {
-                if !e.attribute_pres("domain_token_key") {
-                    let k = HS512::generate_key()
-                        .map(|k| Value::new_secret_str(&k))
+                if !e.attribute_pres("fernet_private_key_str") {
+                    security_info!("regenerating domain token encryption key");
+                    let k = fernet::Fernet::generate_key();
+                    let v = Value::new_secret_str(&k);
+                    e.add_ava("fernet_private_key_str", v);
+                }
+                if !e.attribute_pres("es256_private_key_der") {
+                    security_info!("regenerating domain es256 private key");
+                    let der = JwsSigner::generate_es256()
+                        .and_then(|jws| jws.private_key_to_der())
                         .map_err(|e| {
-                            admin_error!(err = ?e, "Failed to generate domain_token_key");
-                            OperationError::InvalidState
+                            admin_error!(err = ?e, "Unable to generate ES256 JwsSigner private key");
+                            OperationError::CryptographyError
                         })?;
-                    e.set_ava("domain_token_key", btreeset![k]);
-                    trace!("plugin_domain: Applying domain_token_key transform");
+                    let v = Value::new_privatebinary(&der);
+                    e.add_ava("es256_private_key_der", v);
                 }
                 trace!(?e);
                 Ok(())

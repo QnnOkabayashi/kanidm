@@ -1,5 +1,7 @@
 #![deny(warnings)]
 #![warn(unused_extern_crates)]
+#![deny(clippy::todo)]
+#![deny(clippy::unimplemented)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
@@ -14,7 +16,7 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 use users::{get_current_gid, get_current_uid, get_effective_gid, get_effective_uid};
 
-use serde_derive::Deserialize;
+use serde::Deserialize;
 use std::fs::{metadata, File, Metadata};
 
 #[cfg(target_family = "unix")]
@@ -27,14 +29,14 @@ use std::str::FromStr;
 
 use kanidm::audit::LogLevel;
 use kanidm::config::{Configuration, OnlineBackup, ServerRole};
-use kanidm::core::{
+use kanidm::tracing_tree;
+use kanidm::utils::file_permissions_readonly;
+use score::{
     backup_server_core, create_server_core, dbscan_get_id2entry_core, dbscan_list_id2entry_core,
     dbscan_list_index_analysis_core, dbscan_list_index_core, dbscan_list_indexes_core,
     domain_rename_core, recover_account_core, reindex_server_core, restore_server_core,
     vacuum_server_core, verify_server_core,
 };
-use kanidm::tracing_tree;
-use kanidm::utils::file_permissions_readonly;
 
 use structopt::StructOpt;
 
@@ -52,6 +54,7 @@ struct ServerConfig {
     pub tls_key: Option<String>,
     pub log_level: Option<String>,
     pub online_backup: Option<OnlineBackup>,
+    pub domain: String,
     pub origin: String,
     #[serde(default)]
     pub role: ServerRole,
@@ -75,16 +78,17 @@ impl KanidmdOpt {
     fn commonopt(&self) -> &CommonOpt {
         match self {
             KanidmdOpt::Server(sopt)
+            | KanidmdOpt::ConfigTest(sopt)
             | KanidmdOpt::Verify(sopt)
             | KanidmdOpt::Reindex(sopt)
             | KanidmdOpt::Vacuum(sopt)
+            | KanidmdOpt::DomainChange(sopt)
             | KanidmdOpt::DbScan(DbScanOpt::ListIndexes(sopt))
             | KanidmdOpt::DbScan(DbScanOpt::ListId2Entry(sopt))
             | KanidmdOpt::DbScan(DbScanOpt::ListIndexAnalysis(sopt)) => &sopt,
             KanidmdOpt::Backup(bopt) => &bopt.commonopts,
             KanidmdOpt::Restore(ropt) => &ropt.commonopts,
             KanidmdOpt::RecoverAccount(ropt) => &ropt.commonopts,
-            KanidmdOpt::DomainChange(dopt) => &dopt.commonopts,
             KanidmdOpt::DbScan(DbScanOpt::ListIndex(dopt)) => &dopt.commonopts,
             // KanidmdOpt::DbScan(DbScanOpt::GetIndex(dopt)) => &dopt.commonopts,
             KanidmdOpt::DbScan(DbScanOpt::GetId2Entry(dopt)) => &dopt.commonopts,
@@ -204,6 +208,7 @@ async fn main() {
     config.update_db_path(&sconfig.db_path.as_str());
     config.update_db_fs_type(&sconfig.db_fs_type);
     config.update_origin(&sconfig.origin.as_str());
+    config.update_domain(&sconfig.domain.as_str());
     config.update_db_arc_size(sconfig.db_arc_size);
     config.update_role(sconfig.role);
 
@@ -213,15 +218,19 @@ async fn main() {
     }
 
     // ::std::env::set_var("RUST_LOG", "tide=info,kanidm=info,webauthn=debug");
+    // env_logger::builder()
+    //     .format_timestamp(None)
+    //     .format_level(false)
+    //     .init();
 
-    env_logger::builder()
-        .format_timestamp(None)
-        .format_level(false)
-        .init();
-
-    match opt {
-        KanidmdOpt::Server(_sopt) => {
-            eprintln!("Running in server mode ...");
+    match &opt {
+        KanidmdOpt::Server(_sopt) | KanidmdOpt::ConfigTest(_sopt) => {
+            let config_test = matches!(&opt, KanidmdOpt::ConfigTest(_));
+            if config_test {
+                eprintln!("Running in server configuration test mode ...");
+            } else {
+                eprintln!("Running in server mode ...");
+            };
 
             // configuration options that only relate to server mode
             config.update_tls(&sconfig.tls_chain, &sconfig.tls_key);
@@ -249,20 +258,25 @@ async fn main() {
                 }
             }
 
-            let sctx = create_server_core(config).await;
-            match sctx {
-                Ok(_sctx) => match tokio::signal::ctrl_c().await {
-                    Ok(_) => {
-                        eprintln!("Ctrl-C received, shutting down");
-                    }
+            let sctx = create_server_core(config, config_test).await;
+            if !config_test {
+                match sctx {
+                    Ok(_sctx) => match tokio::signal::ctrl_c().await {
+                        Ok(_) => {
+                            eprintln!("Ctrl-C received, shutting down");
+                        }
+                        Err(_) => {
+                            eprintln!("Invalid signal received, shutting down as a precaution ...");
+                        }
+                    },
                     Err(_) => {
-                        eprintln!("Invalid signal received, shutting down as a precaution ...");
+                        eprintln!("Failed to start server core!");
+                        // We may need to return an exit code here, but that may take some re-architecting
+                        // to ensure we drop everything cleanly.
+                        return;
                     }
-                },
-                Err(_) => {
-                    eprintln!("Failed to start server core!");
-                    return;
                 }
+                eprintln!("stopped 🛑 ");
             }
         }
         KanidmdOpt::Backup(bopt) => {
@@ -303,9 +317,9 @@ async fn main() {
             eprintln!("Running in vacuum mode ...");
             vacuum_server_core(&config);
         }
-        KanidmdOpt::DomainChange(dopt) => {
+        KanidmdOpt::DomainChange(_dopt) => {
             eprintln!("Running in domain name change mode ... this may take a long time ...");
-            domain_rename_core(&config, &dopt.new_domain_name);
+            domain_rename_core(&config);
         }
         KanidmdOpt::DbScan(DbScanOpt::ListIndexes(_)) => {
             eprintln!("👀 db scan - list indexes");

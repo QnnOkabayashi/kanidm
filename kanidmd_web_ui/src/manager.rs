@@ -4,24 +4,25 @@
 //! not atuhenticated, this will determine that and send you to authentication first, then
 //! will allow you to proceed with the oauth flow.
 
+use gloo::console;
+use wasm_bindgen::UnwrapThrowExt;
+use yew::functional::*;
 use yew::prelude::*;
-use yew_services::ConsoleService;
-
 use yew_router::prelude::*;
-use yew_router::router::Router;
 
 use crate::login::LoginApp;
 use crate::oauth2::Oauth2App;
-use crate::views::ViewsApp;
+use crate::views::{ViewRoute, ViewsApp};
+use serde::{Deserialize, Serialize};
 
 // router to decide on state.
-#[derive(Routable, PartialEq, Clone, Debug)]
+#[derive(Routable, PartialEq, Clone, Debug, Serialize, Deserialize)]
 pub enum Route {
     #[at("/")]
     Landing,
 
-    #[at("/ui/view")]
-    Index,
+    #[at("/ui/view/:s")]
+    Views,
 
     #[at("/ui/login")]
     Login,
@@ -34,88 +35,67 @@ pub enum Route {
     NotFound,
 }
 
-fn switch(routes: &Route) -> Html {
-    ConsoleService::log("manager::switch");
-    match routes {
-        Route::Landing => {
-            yew_router::push_route(Route::Index);
-            html! { <body></body> }
-        }
-        Route::Index => html! { <ViewsApp /> },
+#[function_component(Landing)]
+fn landing() -> Html {
+    // Do this to allow use_history to work because lol.
+    use_history()
+        .expect_throw("Unable to access history")
+        .push(ViewRoute::Apps);
+    html! { <main></main> }
+}
+
+fn switch(route: &Route) -> Html {
+    console::log!("manager::switch");
+    match route {
+        Route::Landing => html! { <Landing /> },
         Route::Login => html! { <LoginApp /> },
         Route::Oauth2 => html! { <Oauth2App /> },
+        Route::Views => html! { <ViewsApp /> },
         Route::NotFound => {
             html! {
-                <body>
+                <main>
                     <h1>{ "404" }</h1>
-                    <Link<Route> route=Route::Index>
+                    <Link<ViewRoute> to={ ViewRoute::Apps }>
                     { "Home" }
-                    </Link<Route>>
-                </body>
+                    </Link<ViewRoute>>
+                </main>
             }
         }
     }
 }
 
-pub struct ManagerApp {
-    link: ComponentLink<Self>,
-    is_ready: bool,
-}
+pub struct ManagerApp {}
 
 impl Component for ManagerApp {
-    type Message = bool;
+    type Message = ();
     type Properties = ();
 
-    fn create(_: Self::Properties, link: ComponentLink<Self>) -> Self {
-        ConsoleService::log("manager::create");
-        ManagerApp {
-            link,
-            is_ready: false,
-        }
+    fn create(_ctx: &Context<Self>) -> Self {
+        console::log!("manager::create");
+        ManagerApp {}
     }
 
-    fn change(&mut self, _: Self::Properties) -> ShouldRender {
-        ConsoleService::log("manager::change");
+    fn changed(&mut self, _ctx: &Context<Self>) -> bool {
+        console::log!("manager::change");
         false
     }
 
-    fn update(&mut self, msg: Self::Message) -> ShouldRender {
-        ConsoleService::log("manager::update");
-        self.is_ready = msg;
+    fn update(&mut self, _ctx: &Context<Self>, _msg: Self::Message) -> bool {
+        console::log!("manager::update");
         true
     }
 
-    fn rendered(&mut self, first_render: bool) {
-        ConsoleService::log("manager::rendered");
-        if first_render {
-            // Can only access the current_route AFTER it renders.
-            // ConsoleService::log(format!("{:?}", yew_router::current_route::<Route>()).as_str())
-            self.link.send_message(first_render)
-        }
+    fn rendered(&mut self, _ctx: &Context<Self>, _first_render: bool) {
+        console::log!("manager::rendered");
+        // Can only access the current_route AFTER it renders.
+        // console::log!(format!("{:?}", yew_router::current_route::<Route>()).as_str())
     }
 
-    fn view(&self) -> Html {
+    fn view(&self, _ctx: &Context<Self>) -> Html {
         html! {
-        <>
-            <head>
-                <meta charset="utf-8"/>
-                <title>{ "Kanidm" }</title>
-                <link rel="stylesheet" href="/pkg/external/bootstrap.min.css" integrity="sha384-EVSTQN3/azprG1Anm3QDgpJLIm9Nao0Yz1ztcQTwFspd3yD65VohhpuuCOmLASjC"/>
-                <link rel="stylesheet" href="/pkg/style.css"/>
-                <script src="/pkg/external/bootstrap.bundle.min.js" integrity="sha384-MrcW6ZMFYlzcLA8Nl+NtUVF0sA7MsXsP1UyJoMp4YLEuNSfAP+JcXn/tWtIaxVXM"></script>
-                <script src="/pkg/external/confetti.js"></script>
-                <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦀</text></svg>" />
-
-            </head>
-
-            {
-                if self.is_ready {
-                    html! {<Router<Route> render=Router::render(switch) /> }
-                } else {
-                    html! { <body></body> }
-                }
-            }
-        </>
+            <BrowserRouter>
+                <Switch<Route> render={ Switch::render(switch) } />
+            </BrowserRouter>
         }
     }
 }

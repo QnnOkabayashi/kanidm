@@ -22,7 +22,7 @@ use crate::credential::webauthn::WebauthnDomainConfig;
 use std::time::Duration;
 use uuid::Uuid;
 // use webauthn_rs::proto::Credential as WebauthnCredential;
-use bundy::hs512::HS512;
+use compact_jwt::{Jws, JwsSigner};
 pub use std::collections::BTreeSet as Set;
 use webauthn_rs::proto::RequestChallengeResponse;
 use webauthn_rs::{AuthenticationState, Webauthn};
@@ -89,7 +89,6 @@ enum CredHandler {
 }
 
 impl CredHandler {
-    // ! TRACING INTEGRATED
     /// Given a credential and some external configuration, Generate the credential handler
     /// that will be used for this session. This credential handler is a "self contained"
     /// unit that defines what is possible to use during this authentication session to prevent
@@ -668,7 +667,7 @@ impl AuthSession {
         async_tx: &Sender<DelayedAction>,
         webauthn: &Webauthn<WebauthnDomainConfig>,
         pw_badlist_set: Option<&HashSet<String>>,
-        uat_bundy_hmac: &HS512,
+        uat_jwt_signer: &JwsSigner,
     ) -> Result<AuthState, OperationError> {
         let (next_state, response) = match &mut self.state {
             AuthSessionState::Init(_) | AuthSessionState::Success | AuthSessionState::Denied(_) => {
@@ -700,11 +699,19 @@ impl AuthSession {
                             .to_userauthtoken(tracing_id, *time, auth_type)
                             .ok_or(OperationError::InvalidState)?;
 
+                        let jwt = Jws { inner: uat };
+
                         // Now encrypt and prepare the token for return to the client.
-                        let token = uat_bundy_hmac.sign(&uat).map_err(|e| {
-                            admin_error!(?e, "Failed to sign UserAuthToken");
-                            OperationError::InvalidState
-                        })?;
+                        let token = jwt
+                            // Do we want to embed this? Or just give the URL? I think we embed
+                            // as we only need the client to be able to check it's not tampered, but
+                            // this isn't a root of trust.
+                            .sign_embed_public_jwk(&uat_jwt_signer)
+                            .map(|jwts| jwts.to_string())
+                            .map_err(|e| {
+                                admin_error!(?e, "Failed to sign UserAuthToken to Jwt");
+                                OperationError::InvalidState
+                            })?;
 
                         (
                             Some(AuthSessionState::Success),
@@ -791,8 +798,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel as unbounded;
     use webauthn_authenticator_rs::{softtok::U2FSoft, WebauthnAuthenticator};
 
-    use bundy::hs512::HS512;
-    use std::str::FromStr;
+    use compact_jwt::JwsSigner;
 
     fn create_pw_badlist_cache() -> HashSet<String> {
         let mut s = HashSet::new();
@@ -808,9 +814,8 @@ mod tests {
         })
     }
 
-    fn create_hs512() -> HS512 {
-        let pkey_str = HS512::generate_key().unwrap();
-        HS512::from_str(&pkey_str).unwrap()
+    fn create_jwt_signer() -> JwsSigner {
+        JwsSigner::generate_es256().expect("failed to construct signer.")
     }
 
     #[test]
@@ -892,14 +897,14 @@ mod tests {
             start_password_session!(&mut audit, account, &webauthn);
 
         let attempt = AuthCredential::Password("bad_password".to_string());
-        let hs512 = create_hs512();
+        let jws_signer = create_jwt_signer();
         match session.validate_creds(
             &attempt,
             &Duration::from_secs(0),
             &async_tx,
             &webauthn,
             Some(&pw_badlist_cache),
-            &hs512,
+            &jws_signer,
         ) {
             Ok(AuthState::Denied(_)) => {}
             _ => panic!(),
@@ -917,7 +922,7 @@ mod tests {
             &async_tx,
             &webauthn,
             Some(&pw_badlist_cache),
-            &hs512,
+            &jws_signer,
         ) {
             Ok(AuthState::Success(_)) => {}
             _ => panic!(),
@@ -930,7 +935,7 @@ mod tests {
     #[test]
     fn test_idm_authsession_simple_password_badlist() {
         let _ = tracing_tree::test_init();
-        let hs512 = create_hs512();
+        let jws_signer = create_jwt_signer();
         let webauthn = create_webauthn();
         // create the ent
         let mut account = entry_str_to_account!(JSON_ADMIN_V1);
@@ -952,7 +957,7 @@ mod tests {
             &async_tx,
             &webauthn,
             Some(&pw_badlist_cache),
-            &hs512,
+            &jws_signer,
         ) {
             Ok(AuthState::Denied(msg)) => assert!(msg == PW_BADLIST_MSG),
             _ => panic!(),
@@ -1018,8 +1023,8 @@ mod tests {
     #[test]
     fn test_idm_authsession_totp_password_mech() {
         let _ = tracing_tree::test_init();
-        let hs512 = create_hs512();
         let webauthn = create_webauthn();
+        let jws_signer = create_jwt_signer();
         // create the ent
         let mut account = entry_str_to_account!(JSON_ADMIN_V1);
 
@@ -1062,7 +1067,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_AUTH_TYPE_MSG),
                 _ => panic!(),
@@ -1082,7 +1087,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_AUTH_TYPE_MSG),
                 _ => panic!(),
@@ -1099,7 +1104,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_TOTP_MSG),
                 _ => panic!(),
@@ -1118,7 +1123,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Continue(cont)) => assert!(cont == vec![AuthAllowed::Password]),
                 _ => panic!(),
@@ -1129,7 +1134,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_PASSWORD_MSG),
                 _ => panic!(),
@@ -1148,7 +1153,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Continue(cont)) => assert!(cont == vec![AuthAllowed::Password]),
                 _ => panic!(),
@@ -1159,7 +1164,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Success(_)) => {}
                 _ => panic!(),
@@ -1174,7 +1179,7 @@ mod tests {
     fn test_idm_authsession_password_mfa_badlist() {
         let _ = tracing_tree::test_init();
         let webauthn = create_webauthn();
-        let hs512 = create_hs512();
+        let jws_signer = create_jwt_signer();
         // create the ent
         let mut account = entry_str_to_account!(JSON_ADMIN_V1);
 
@@ -1215,7 +1220,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Continue(cont)) => assert!(cont == vec![AuthAllowed::Password]),
                 _ => panic!(),
@@ -1226,7 +1231,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == PW_BADLIST_MSG),
                 _ => panic!(),
@@ -1309,7 +1314,7 @@ mod tests {
         let mut account = entry_str_to_account!(JSON_ADMIN_V1);
 
         let (webauthn, mut wa, wan_cred) = setup_webauthn(account.name.as_str());
-        let hs512 = create_hs512();
+        let jws_signer = create_jwt_signer();
 
         // Now create the credential for the account.
         let cred = Credential::new_webauthn_only("soft".to_string(), wan_cred);
@@ -1328,7 +1333,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 None,
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_AUTH_TYPE_MSG),
                 _ => panic!(),
@@ -1349,7 +1354,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 None,
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Success(_)) => {}
                 _ => panic!(),
@@ -1378,7 +1383,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 None,
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_WEBAUTHN_MSG),
                 _ => panic!(),
@@ -1420,7 +1425,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 None,
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_WEBAUTHN_MSG),
                 _ => panic!(),
@@ -1440,7 +1445,7 @@ mod tests {
         let mut account = entry_str_to_account!(JSON_ADMIN_V1);
 
         let (webauthn, mut wa, wan_cred) = setup_webauthn(account.name.as_str());
-        let hs512 = create_hs512();
+        let jws_signer = create_jwt_signer();
         let pw_good = "test_password";
         let pw_bad = "bad_password";
 
@@ -1464,7 +1469,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_AUTH_TYPE_MSG),
                 _ => panic!(),
@@ -1482,7 +1487,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_AUTH_TYPE_MSG),
                 _ => panic!(),
@@ -1510,7 +1515,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_WEBAUTHN_MSG),
                 _ => panic!(),
@@ -1533,7 +1538,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Continue(cont)) => assert!(cont == vec![AuthAllowed::Password]),
                 _ => panic!(),
@@ -1544,7 +1549,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_PASSWORD_MSG),
                 _ => panic!(),
@@ -1573,7 +1578,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Continue(cont)) => assert!(cont == vec![AuthAllowed::Password]),
                 _ => panic!(),
@@ -1584,7 +1589,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Success(_)) => {}
                 _ => panic!(),
@@ -1610,7 +1615,7 @@ mod tests {
         let mut account = entry_str_to_account!(JSON_ADMIN_V1);
 
         let (webauthn, mut wa, wan_cred) = setup_webauthn(account.name.as_str());
-        let hs512 = create_hs512();
+        let jws_signer = create_jwt_signer();
 
         let totp = Totp::generate_secure(TOTP_DEFAULT_STEP);
         let totp_good = totp
@@ -1645,7 +1650,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_AUTH_TYPE_MSG),
                 _ => panic!(),
@@ -1663,7 +1668,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_TOTP_MSG),
                 _ => panic!(),
@@ -1689,7 +1694,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_WEBAUTHN_MSG),
                 _ => panic!(),
@@ -1712,7 +1717,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Continue(cont)) => assert!(cont == vec![AuthAllowed::Password]),
                 _ => panic!(),
@@ -1723,7 +1728,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_PASSWORD_MSG),
                 _ => panic!(),
@@ -1747,7 +1752,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Continue(cont)) => assert!(cont == vec![AuthAllowed::Password]),
                 _ => panic!(),
@@ -1758,7 +1763,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_PASSWORD_MSG),
                 _ => panic!(),
@@ -1776,7 +1781,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Continue(cont)) => assert!(cont == vec![AuthAllowed::Password]),
                 _ => panic!(),
@@ -1787,7 +1792,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Success(_)) => {}
                 _ => panic!(),
@@ -1810,7 +1815,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Continue(cont)) => assert!(cont == vec![AuthAllowed::Password]),
                 _ => panic!(),
@@ -1821,7 +1826,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Success(_)) => {}
                 _ => panic!(),
@@ -1841,7 +1846,7 @@ mod tests {
     #[test]
     fn test_idm_authsession_backup_code_mech() {
         let _ = tracing_tree::test_init();
-        let hs512 = create_hs512();
+        let jws_signer = create_jwt_signer();
         let webauthn = create_webauthn();
         // create the ent
         let mut account = entry_str_to_account!(JSON_ADMIN_V1);
@@ -1862,7 +1867,7 @@ mod tests {
         let backup_code_good = readable_password_from_random();
         let backup_code_bad = readable_password_from_random();
         assert!(backup_code_bad != backup_code_good);
-        let mut code_set = std::collections::HashSet::new();
+        let mut code_set = HashSet::new();
         code_set.insert(backup_code_good.clone());
 
         let backup_codes = BackupCodes::new(code_set);
@@ -1893,7 +1898,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_AUTH_TYPE_MSG),
                 _ => panic!(),
@@ -1910,7 +1915,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_BACKUPCODE_MSG),
                 _ => panic!(),
@@ -1928,7 +1933,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Continue(cont)) => assert!(cont == vec![AuthAllowed::Password]),
                 _ => panic!(),
@@ -1939,7 +1944,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Denied(msg)) => assert!(msg == BAD_PASSWORD_MSG),
                 _ => panic!(),
@@ -1963,7 +1968,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Continue(cont)) => assert!(cont == vec![AuthAllowed::Password]),
                 _ => panic!(),
@@ -1974,7 +1979,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Success(_)) => {}
                 _ => panic!(),
@@ -1999,7 +2004,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Continue(cont)) => assert!(cont == vec![AuthAllowed::Password]),
                 _ => panic!(),
@@ -2010,7 +2015,7 @@ mod tests {
                 &async_tx,
                 &webauthn,
                 Some(&pw_badlist_cache),
-                &hs512,
+                &jws_signer,
             ) {
                 Ok(AuthState::Success(_)) => {}
                 _ => panic!(),

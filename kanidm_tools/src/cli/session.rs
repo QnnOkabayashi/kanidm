@@ -10,9 +10,12 @@ use std::fs::{create_dir, File};
 use std::io::ErrorKind;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::PathBuf;
+use std::str::FromStr;
 use webauthn_authenticator_rs::{u2fhid::U2FHid, RequestChallengeResponse, WebauthnAuthenticator};
 
 use dialoguer::{theme::ColorfulTheme, Select};
+
+use compact_jwt::JwsUnverified;
 
 static TOKEN_DIR: &str = "~/.cache";
 static TOKEN_PATH: &str = "~/.cache/kanidm_tokens";
@@ -115,11 +118,11 @@ pub fn write_tokens(tokens: &BTreeMap<String, String>) -> Result<(), ()> {
 }
 
 /// An interactive dialog to choose from given options
-fn get_index_choice_dialoguer(msg: &str, options: &Vec<String>) -> usize {
+fn get_index_choice_dialoguer(msg: &str, options: &[String]) -> usize {
     let user_select = Select::with_theme(&ColorfulTheme::default())
         .with_prompt(msg)
         .default(0)
-        .items(&options)
+        .items(options)
         .interact();
 
     let selection = match user_select {
@@ -238,7 +241,7 @@ impl LoginOpt {
                     options.push(val.to_string());
                 }
                 let msg = "Please choose how you want to authenticate:";
-                let selection = get_index_choice_dialoguer(&msg, &options);
+                let selection = get_index_choice_dialoguer(msg, &options);
 
                 #[allow(clippy::expect_used)]
                 mechs
@@ -276,7 +279,7 @@ impl LoginOpt {
                         options.push(val.to_string());
                     }
                     let msg = "Please choose what credential to provide:";
-                    let selection = get_index_choice_dialoguer(&msg, &options);
+                    let selection = get_index_choice_dialoguer(msg, &options);
 
                     #[allow(clippy::expect_used)]
                     allowed
@@ -398,9 +401,21 @@ impl SessionOpt {
             })
             .into_iter()
             .filter_map(|(u, t)| {
-                unsafe { bundy::Data::parse_without_verification::<UserAuthToken>(&t) }
+                let jwtu = JwsUnverified::from_str(&t)
+                    .map_err(|e| {
+                        error!(?e, "Unable to parse token from str");
+                    })
+                    .ok()?;
+
+                jwtu.validate_embeded()
+                    .map_err(|e| {
+                        error!(?e, "Unable to verify token signature, may be corrupt");
+                    })
+                    .map(|jwt| {
+                        let uat = jwt.inner;
+                        (u, (t, uat))
+                    })
                     .ok()
-                    .map(|uat| (u, (t, uat)))
             })
             .collect()
     }

@@ -1,5 +1,7 @@
 #![deny(warnings)]
 #![warn(unused_extern_crates)]
+#![deny(clippy::todo)]
+#![deny(clippy::unimplemented)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
@@ -9,9 +11,8 @@
 #![deny(clippy::trivially_copy_pass_by_ref)]
 
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
-use log::debug;
 use structopt::StructOpt;
 
 use futures::executor::block_on;
@@ -27,10 +28,8 @@ async fn main() {
     let opt = CacheInvalidateOpt::from_args();
     if opt.debug {
         ::std::env::set_var("RUST_LOG", "kanidm=debug,kanidm_client=debug");
-    } else {
-        ::std::env::set_var("RUST_LOG", "kanidm=info,kanidm_client=info");
     }
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
     debug!("Starting cache invalidate tool ...");
 

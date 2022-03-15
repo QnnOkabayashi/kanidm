@@ -1,8 +1,8 @@
 [package]
 name = "kanidm_client"
-version = "1.1.0-alpha.6"
+version = "1.1.0-alpha.7"
 authors = ["William Brown <william@blackhats.net.au>"]
-edition = "2018"
+edition = "2021"
 license = "MPL-2.0"
 description = "Kanidm Client Library"
 documentation = "https://docs.rs/kanidm_client/latest/kanidm_client/"
@@ -10,12 +10,11 @@ homepage = "https://github.com/kanidm/kanidm/"
 repository = "https://github.com/kanidm/kanidm/"
 
 [dependencies]
-log = "0.4"
+tracing = "0.1"
 reqwest = { version = "0.11", features=["cookies", "json", "native-tls"] }
 kanidm_proto = { path = "../kanidm_proto", version = "1.1.0-alpha" }
-serde = "1.0"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
-serde_derive = "1.0"
 toml = "0.5"
 uuid = { version = "0.8", features = ["serde", "v4"] }
 url = { version = "2", features = ["serde"] }
@@ -23,12 +22,14 @@ webauthn-rs = "0.3"
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "signal"] }
 
 [dev-dependencies]
-env_logger = "0.9"
+tracing-subscriber = "0.3"
 tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync", "signal"] }
 kanidm = { path = "../kanidmd" }
+score = { path = "../kanidmd/score" }
 futures = "0.3"
 async-std = { version = "1.6", features = ["tokio1"] }
 
 webauthn-authenticator-rs = "0.3.0-alpha.12"
 oauth2_ext = { package = "oauth2", version = "4.0", default-features = false }
 base64 = "0.13"
+compact_jwt = "^0.1.5"

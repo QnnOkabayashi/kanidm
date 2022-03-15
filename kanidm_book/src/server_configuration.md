@@ -1,5 +1,7 @@
 ## Configuring the Server
 
+### Configuring server.toml
+
 You will also need a config file in the volume named `server.toml` (Within the container it should be `/data/server.toml`). Its contents should be as follows:
 
     #   The webserver bind address. Will use HTTPS if tls_* is provided.
@@ -35,8 +37,21 @@ You will also need a config file in the volume named `server.toml` (Within the c
     #   Defaults to "default"
     # log_level = "default"
     #
+    #   The DNS domain name of the server. This is used in a number of security-critical contexts
+    #   such as webauthn, so it *must* match your DNS hostname. It is what is used to create
+    #   security principal names such as `william@idm.example.com` so that in a (future)
+    #   trust configuration it is possible to have unique spn's throughout the topology.
+    #   ⚠️  WARNING ⚠️
+    #   Changing this value WILL break many types of registered credentials for accounts
+    #   including but not limited to webauthn, oauth tokens, and more.
+    #   If you change this value you *must* run `kanidmd domain_name_change` immediately
+    #   after.
+    domain = "idm.example.com"
+    #
     #   The origin for webauthn. This is the url to the server, with the port included if
-    #   it is non-standard (any port except 443)
+    #   it is non-standard (any port except 443). This must match or be a descendent of the
+    #   domain name you configure above. If these two items are not consistent, the server
+    #   WILL refuse to start!
     # origin = "https://idm.example.com"
     origin = "https://idm.example.com:8443"
     #
@@ -68,16 +83,26 @@ You will also need a config file in the volume named `server.toml` (Within the c
 
 An example is located in [examples/server.toml](../../examples/server.toml).
 
-Then you can setup the initial admin account and initialise the database into your volume.
+### Domain Name
 
-    docker run --rm -i -t -v kanidmd:/data kanidm/server:latest /sbin/kanidmd recover_account -c /data/server.toml -n admin
-
-You then want to set your domain name so that security principal names (spn's) are generated correctly.
+You then *MUST* set your domain name so that security principal names (spn's) are generated correctly.
 This domain name _must_ match the url/origin of the server that you plan to use to interact with
 so that other features work correctly. It is possible to change this domain name later.
 
     docker run --rm -i -t -v kanidmd:/data kanidm/server:latest /sbin/kanidmd domain_name_change -c /data/server.toml -n idm.example.com
 
+> **WARNING** You MUST set the domain name correctly, aligned with your origin, else the server
+> may refuse to start, or some features may not work correctly!
+
+### Default Admin Account
+
+Then you can setup the initial admin account and initialise the database into your volume.
+
+    docker run --rm -i -t -v kanidmd:/data kanidm/server:latest /sbin/kanidmd recover_account -c /data/server.toml -n admin
+
+### Run the Server
+
 Now we can run the server so that it can accept connections. This defaults to using `-c /data/server.toml`
 
     docker run -p 8443:8443 -v kanidmd:/data kanidm/server:latest
+

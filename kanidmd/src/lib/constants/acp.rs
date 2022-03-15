@@ -168,7 +168,7 @@ pub const JSON_IDM_ACP_PEOPLE_READ_PRIV_V1: &str = r#"{
             "{\"eq\":[\"memberof\",\"00000000-0000-0000-0000-000000000002\"]}"
         ],
         "acp_targetscope": [
-            "{\"and\": [{\"eq\": [\"class\",\"account\"]}, {\"andnot\": {\"or\": [{\"eq\": [\"memberof\",\"00000000-0000-0000-0000-000000001000\"]}, {\"eq\": [\"class\", \"tombstone\"]}, {\"eq\": [\"class\", \"recycled\"]}]}}]}"
+            "{\"and\": [{\"eq\": [\"class\",\"person\"]}, {\"andnot\": {\"or\": [{\"eq\": [\"memberof\",\"00000000-0000-0000-0000-000000001000\"]}, {\"eq\": [\"class\", \"tombstone\"]}, {\"eq\": [\"class\", \"recycled\"]}]}}]}"
         ],
         "acp_search_attr": [
             "name", "displayname", "legalname", "mail"
@@ -278,8 +278,85 @@ pub const JSON_IDM_ACP_PEOPLE_EXTEND_PRIV_V1: &str = r#"{
         "acp_targetscope": [
             "{\"and\": [{\"eq\": [\"class\",\"account\"]}, {\"andnot\": {\"or\": [{\"eq\": [\"memberof\",\"00000000-0000-0000-0000-000000001000\"]}, {\"eq\": [\"class\", \"tombstone\"]}, {\"eq\": [\"class\", \"recycled\"]}]}}]}"
         ],
+        "acp_modify_removedattr": [
+            "name", "displayname", "legalname", "mail"
+        ],
         "acp_modify_presentattr": [
-            "class"
+            "class", "name", "displayname", "legalname", "mail"
+        ],
+        "acp_modify_class": ["person"]
+    }
+}"#;
+
+// -- hp people
+pub const JSON_IDM_ACP_HP_PEOPLE_READ_PRIV_V1: &str = r#"{
+    "attrs": {
+        "class": [
+            "object",
+            "access_control_profile",
+            "access_control_search"
+        ],
+        "name": ["idm_acp_hp_people_read_priv"],
+        "uuid": ["00000000-0000-0000-0000-ffffff000036"],
+        "description": ["Builtin IDM Control for reading high privilege personal sensitive data."],
+        "acp_receiver": [
+            "{\"eq\":[\"memberof\",\"00000000-0000-0000-0000-000000000028\"]}"
+        ],
+        "acp_targetscope": [
+            "{\"and\": [{\"eq\": [\"class\",\"person\"]}, {\"eq\": [\"memberof\",\"00000000-0000-0000-0000-000000001000\"]}, {\"andnot\": {\"or\": [{\"eq\": [\"class\", \"tombstone\"]}, {\"eq\": [\"class\", \"recycled\"]}]}}]}"
+        ],
+        "acp_search_attr": [
+            "name", "displayname", "legalname", "mail"
+        ]
+    }
+}"#;
+
+pub const JSON_IDM_ACP_HP_PEOPLE_WRITE_PRIV_V1: &str = r#"{
+    "attrs": {
+        "class": [
+            "object",
+            "access_control_profile",
+            "access_control_modify"
+        ],
+        "name": ["idm_acp_hp_people_write_priv"],
+        "uuid": ["00000000-0000-0000-0000-ffffff000037"],
+        "description": ["Builtin IDM Control for managing privilege personal and sensitive data."],
+        "acp_receiver": [
+            "{\"eq\":[\"memberof\",\"00000000-0000-0000-0000-000000000029\"]}"
+        ],
+        "acp_targetscope": [
+            "{\"and\": [{\"eq\": [\"class\",\"person\"]}, {\"eq\": [\"memberof\",\"00000000-0000-0000-0000-000000001000\"]}, {\"andnot\": {\"or\": [{\"eq\": [\"class\", \"tombstone\"]}, {\"eq\": [\"class\", \"recycled\"]}]}}]}"
+        ],
+        "acp_modify_removedattr": [
+            "name", "displayname", "legalname", "mail"
+        ],
+        "acp_modify_presentattr": [
+            "name", "displayname", "legalname", "mail"
+        ]
+    }
+}"#;
+
+pub const JSON_IDM_ACP_HP_PEOPLE_EXTEND_PRIV_V1: &str = r#"{
+    "attrs": {
+        "class": [
+            "object",
+            "access_control_profile",
+            "access_control_modify"
+        ],
+        "name": ["idm_acp_hp_people_extend_priv"],
+        "uuid": ["00000000-0000-0000-0000-ffffff000038"],
+        "description": ["Builtin IDM Control for allowing privilege person class extension"],
+        "acp_receiver": [
+            "{\"eq\":[\"memberof\",\"00000000-0000-0000-0000-000000000030\"]}"
+        ],
+        "acp_targetscope": [
+            "{\"and\": [{\"eq\": [\"class\",\"account\"]}, {\"eq\": [\"memberof\",\"00000000-0000-0000-0000-000000001000\"]}, {\"andnot\": {\"or\": [{\"eq\": [\"class\", \"tombstone\"]}, {\"eq\": [\"class\", \"recycled\"]}]}}]}"
+        ],
+        "acp_modify_removedattr": [
+            "name", "displayname", "legalname", "mail"
+        ],
+        "acp_modify_presentattr": [
+            "class", "name", "displayname", "legalname", "mail"
         ],
         "acp_modify_class": ["person"]
     }
@@ -397,9 +474,58 @@ pub const JSON_IDM_ACP_ACCOUNT_MANAGE_PRIV_V1: &str = r#"{
         ]
     }
 }"#;
+
 // 14 radius read acp JSON_IDM_RADIUS_SERVERS_V1
 // The targetscope of this could change later to a "radius access" group or similar so we can add/remove
 //  users from having radius access easier.
+
+pub const JSON_IDM_ACP_RADIUS_SECRET_READ_PRIV_V1: &str = r#"{
+    "attrs": {
+        "class": [
+            "object",
+            "access_control_profile",
+            "access_control_search"
+        ],
+        "name": ["idm_acp_radius_secret_read_priv"],
+        "uuid": ["00000000-0000-0000-0000-ffffff000039"],
+        "description": ["Builtin IDM Control for reading radius secrets of accounts."],
+        "acp_receiver": [
+            "{\"eq\":[\"memberof\",\"00000000-0000-0000-0000-000000000032\"]}"
+        ],
+        "acp_targetscope": [
+            "{\"and\": [{\"eq\": [\"class\",\"account\"]}, {\"andnot\": {\"or\": [{\"eq\": [\"memberof\",\"00000000-0000-0000-0000-000000001000\"]}, {\"eq\": [\"class\", \"tombstone\"]}, {\"eq\": [\"class\", \"recycled\"]}]}}]}"
+        ],
+        "acp_search_attr": [
+            "radius_secret"
+        ]
+    }
+}"#;
+
+pub const JSON_IDM_ACP_RADIUS_SECRET_WRITE_PRIV_V1: &str = r#"{
+    "attrs": {
+        "class": [
+            "object",
+            "access_control_profile",
+            "access_control_modify"
+        ],
+        "name": ["idm_acp_radius_secret_write_priv"],
+        "uuid": ["00000000-0000-0000-0000-ffffff000040"],
+        "description": ["Builtin IDM Control allowing writes to user radius secrets."],
+        "acp_receiver": [
+            "{\"eq\":[\"memberof\",\"00000000-0000-0000-0000-000000000031\"]}"
+        ],
+        "acp_targetscope": [
+            "{\"and\": [{\"eq\": [\"class\",\"account\"]}, {\"andnot\": {\"or\": [{\"eq\": [\"memberof\",\"00000000-0000-0000-0000-000000001000\"]}, {\"eq\": [\"class\", \"tombstone\"]}, {\"eq\": [\"class\", \"recycled\"]}]}}]}"
+        ],
+        "acp_modify_removedattr": [
+            "radius_secret"
+        ],
+        "acp_modify_presentattr": [
+            "radius_secret"
+        ]
+    }
+}"#;
+
 pub const JSON_IDM_ACP_RADIUS_SERVERS_V1: &str = r#"{
     "attrs": {
         "class": [
@@ -421,6 +547,7 @@ pub const JSON_IDM_ACP_RADIUS_SERVERS_V1: &str = r#"{
         ]
     }
 }"#;
+
 // 15 high priv account read JSON_IDM_HP_ACCOUNT_READ_PRIV_V1
 pub const JSON_IDM_ACP_HP_ACCOUNT_READ_PRIV_V1: &str = r#"{
     "attrs": {
@@ -827,11 +954,13 @@ pub const JSON_IDM_ACP_DOMAIN_ADMIN_PRIV_V1: &str = r#"{
             "domain_name",
             "domain_ssid",
             "domain_uuid",
-            "domain_token_key"
+            "fernet_private_key_str",
+            "es256_private_key_der"
         ],
         "acp_modify_removedattr": [
             "domain_ssid",
-            "domain_token_key"
+            "fernet_private_key_str",
+            "es256_private_key_der"
         ],
         "acp_modify_presentattr": [
             "domain_ssid"
@@ -891,7 +1020,7 @@ pub const JSON_IDM_ACP_ACCOUNT_UNIX_EXTEND_PRIV_V1: &str = r#"{
             "class", "name", "spn", "uuid", "description", "gidnumber", "loginshell", "unix_password"
         ],
         "acp_modify_removedattr": [
-            "class", "loginshell", "gidnumber", "unix_password"
+            "loginshell", "gidnumber", "unix_password"
         ],
         "acp_modify_presentattr": [
             "class", "loginshell", "gidnumber", "unix_password"
@@ -921,7 +1050,7 @@ pub const JSON_IDM_ACP_GROUP_UNIX_EXTEND_PRIV_V1: &str = r#"{
             "class", "name", "spn", "uuid", "description", "member", "gidnumber"
         ],
         "acp_modify_removedattr": [
-            "class", "gidnumber"
+            "gidnumber"
         ],
         "acp_modify_presentattr": [
             "class", "gidnumber"
@@ -952,7 +1081,7 @@ pub const JSON_IDM_HP_ACP_ACCOUNT_UNIX_EXTEND_PRIV_V1: &str = r#"{
             "class", "name", "spn", "uuid", "description", "gidnumber", "loginshell", "unix_password"
         ],
         "acp_modify_removedattr": [
-            "class", "loginshell", "gidnumber", "unix_password"
+            "loginshell", "gidnumber", "unix_password"
         ],
         "acp_modify_presentattr": [
             "class", "loginshell", "gidnumber", "unix_password"
@@ -982,7 +1111,7 @@ pub const JSON_IDM_HP_ACP_GROUP_UNIX_EXTEND_PRIV_V1: &str = r#"{
             "class", "name", "spn", "uuid", "description", "member", "gidnumber"
         ],
         "acp_modify_removedattr": [
-            "class", "gidnumber"
+            "gidnumber"
         ],
         "acp_modify_presentattr": [
             "class", "gidnumber"
@@ -1020,7 +1149,11 @@ pub const JSON_IDM_HP_ACP_OAUTH2_MANAGE_PRIV_V1: &str = r#"{
             "oauth2_rs_scope_map",
             "oauth2_rs_implicit_scopes",
             "oauth2_rs_basic_secret",
-            "oauth2_rs_token_key"
+            "oauth2_rs_token_key",
+            "es256_private_key_der",
+            "oauth2_allow_insecure_client_disable_pkce",
+            "rs256_private_key_der",
+            "oauth2_jwt_legacy_crypto_enable"
         ],
         "acp_modify_removedattr": [
             "description",
@@ -1030,7 +1163,11 @@ pub const JSON_IDM_HP_ACP_OAUTH2_MANAGE_PRIV_V1: &str = r#"{
             "oauth2_rs_scope_map",
             "oauth2_rs_implicit_scopes",
             "oauth2_rs_basic_secret",
-            "oauth2_rs_token_key"
+            "oauth2_rs_token_key",
+            "es256_private_key_der",
+            "oauth2_allow_insecure_client_disable_pkce",
+            "rs256_private_key_der",
+            "oauth2_jwt_legacy_crypto_enable"
         ],
         "acp_modify_presentattr": [
             "description",
@@ -1038,7 +1175,9 @@ pub const JSON_IDM_HP_ACP_OAUTH2_MANAGE_PRIV_V1: &str = r#"{
             "oauth2_rs_name",
             "oauth2_rs_origin",
             "oauth2_rs_scope_map",
-            "oauth2_rs_implicit_scopes"
+            "oauth2_rs_implicit_scopes",
+            "oauth2_allow_insecure_client_disable_pkce",
+            "oauth2_jwt_legacy_crypto_enable"
         ],
         "acp_modify_class": [],
         "acp_create_attr": [
@@ -1048,7 +1187,9 @@ pub const JSON_IDM_HP_ACP_OAUTH2_MANAGE_PRIV_V1: &str = r#"{
             "oauth2_rs_name",
             "oauth2_rs_origin",
             "oauth2_rs_scope_map",
-            "oauth2_rs_implicit_scopes"
+            "oauth2_rs_implicit_scopes",
+            "oauth2_allow_insecure_client_disable_pkce",
+            "oauth2_jwt_legacy_crypto_enable"
         ],
         "acp_create_class": ["oauth2_resource_server", "oauth2_resource_server_basic", "object"]
     }

@@ -30,6 +30,7 @@ pub(crate) struct UnixUserAccount {
     pub valid_from: Option<OffsetDateTime>,
     pub expire: Option<OffsetDateTime>,
     pub radius_secret: Option<String>,
+    pub mail: Vec<String>,
 }
 
 lazy_static! {
@@ -60,12 +61,9 @@ macro_rules! try_from_entry {
                 OperationError::InvalidAccountState("Missing attribute: name".to_string())
             })?;
 
-        let spn = $value
-            .get_ava_single("spn")
-            .map(|v| v.to_proto_string_clone())
-            .ok_or_else(|| {
-                OperationError::InvalidAccountState("Missing attribute: spn".to_string())
-            })?;
+        let spn = $value.get_ava_single_proto_string("spn").ok_or_else(|| {
+            OperationError::InvalidAccountState("Missing attribute: spn".to_string())
+        })?;
 
         let uuid = *$value.get_uuid();
 
@@ -97,6 +95,11 @@ macro_rules! try_from_entry {
             .get_ava_single_secret("radius_secret")
             .map(str::to_string);
 
+        let mail = $value
+            .get_ava_iter_mail("mail")
+            .map(|i| i.map(str::to_string).collect())
+            .unwrap_or_else(Vec::new);
+
         let valid_from = $value.get_ava_single_datetime("account_valid_from");
 
         let expire = $value.get_ava_single_datetime("account_expire");
@@ -114,6 +117,7 @@ macro_rules! try_from_entry {
             valid_from,
             expire,
             radius_secret,
+            mail,
         })
     }};
 }
@@ -127,7 +131,6 @@ impl UnixUserAccount {
         try_from_entry!(value, groups)
     }
 
-    // ! TRACING INTEGRATED
     pub(crate) fn try_from_entry_ro(
         value: &Entry<EntrySealed, EntryCommitted>,
         qs: &mut QueryServerReadTransaction,
@@ -163,12 +166,10 @@ impl UnixUserAccount {
         })
     }
 
-    pub fn unix_cred_uuid(&self) -> Option<Uuid> {
-        self.cred.as_ref().map(|c| c.uuid)
-    }
-
-    pub fn unix_cred_softlock_policy(&self) -> Option<CredSoftLockPolicy> {
-        self.cred.as_ref().and_then(|cred| cred.softlock_policy())
+    pub fn unix_cred_uuid_and_policy(&self) -> Option<(Uuid, CredSoftLockPolicy)> {
+        self.cred
+            .as_ref()
+            .map(|cred| (cred.uuid, cred.softlock_policy()))
     }
 
     pub fn is_anonymous(&self) -> bool {
@@ -206,7 +207,21 @@ impl UnixUserAccount {
         vmin && vmax
     }
 
-    // ! TRACING INTEGRATED
+    // Get related inputs, such as account name, email, etc.
+    pub fn related_inputs(&self) -> Vec<&str> {
+        let mut inputs = Vec::with_capacity(4 + self.mail.len());
+        self.mail.iter().for_each(|m| {
+            inputs.push(m.as_str());
+        });
+        inputs.push(self.name.as_str());
+        inputs.push(self.spn.as_str());
+        inputs.push(self.displayname.as_str());
+        if let Some(s) = self.radius_secret.as_deref() {
+            inputs.push(s);
+        }
+        inputs
+    }
+
     pub(crate) fn verify_unix_credential(
         &self,
         cleartext: &str,
@@ -298,12 +313,9 @@ macro_rules! try_from_group_e {
                 OperationError::InvalidAccountState("Missing attribute: name".to_string())
             })?;
 
-        let spn = $value
-            .get_ava_single("spn")
-            .map(|v| v.to_proto_string_clone())
-            .ok_or_else(|| {
-                OperationError::InvalidAccountState("Missing attribute: spn".to_string())
-            })?;
+        let spn = $value.get_ava_single_proto_string("spn").ok_or_else(|| {
+            OperationError::InvalidAccountState("Missing attribute: spn".to_string())
+        })?;
 
         let uuid = *$value.get_uuid();
 
@@ -344,12 +356,9 @@ macro_rules! try_from_account_group_e {
                 OperationError::InvalidAccountState("Missing attribute: name".to_string())
             })?;
 
-        let spn = $value
-            .get_ava_single("spn")
-            .map(|v| v.to_proto_string_clone())
-            .ok_or_else(|| {
-                OperationError::InvalidAccountState("Missing attribute: spn".to_string())
-            })?;
+        let spn = $value.get_ava_single_proto_string("spn").ok_or_else(|| {
+            OperationError::InvalidAccountState("Missing attribute: spn".to_string())
+        })?;
 
         let uuid = *$value.get_uuid();
 
@@ -398,7 +407,6 @@ impl UnixGroup {
         try_from_account_group_e!(value, qs)
     }
 
-    // ! TRACING INTEGRATED
     pub fn try_from_account_entry_ro(
         value: &Entry<EntrySealed, EntryCommitted>,
         qs: &mut QueryServerReadTransaction,

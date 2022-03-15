@@ -31,7 +31,7 @@ use kanidm_proto::v1::{
     SearchRequest, SearchResponse, UserAuthToken, WhoamiResponse,
 };
 
-use ldap3_server::simple::LdapFilter;
+use ldap3_proto::simple::LdapFilter;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use uuid::Uuid;
@@ -45,7 +45,6 @@ pub struct SearchResult {
 }
 
 impl SearchResult {
-    // ! TRACING INTEGRATED
     pub fn new(
         qs: &QueryServerReadTransaction,
         entries: &[Entry<EntryReduced, EntryCommitted>],
@@ -86,7 +85,6 @@ pub struct SearchEvent {
 }
 
 impl SearchEvent {
-    // ! TRACING INTEGRATED
     pub fn from_message(
         ident: Identity,
         req: &SearchRequest,

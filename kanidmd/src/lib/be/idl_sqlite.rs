@@ -113,17 +113,15 @@ pub struct IdlSqliteWriteTransaction {
 pub trait IdlSqliteTransaction {
     fn get_conn(&self) -> &r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>;
 
-    // ! TRACING INTEGRATED
     fn get_identry(&self, idl: &IdList) -> Result<Vec<Arc<EntrySealedCommitted>>, OperationError> {
         spanned!("be::idl_sqlite::get_identry", {
             self.get_identry_raw(idl)?
                 .into_iter()
-                .map(|ide| ide.into_entry().map(|e| Arc::new(e)))
+                .map(|ide| ide.into_entry().map(Arc::new))
                 .collect()
         })
     }
 
-    // ! TRACING INTEGRATED
     fn get_identry_raw(&self, idl: &IdList) -> Result<Vec<IdRawEntry>, OperationError> {
         // is the idl allids?
         match idl {
@@ -193,7 +191,6 @@ pub trait IdlSqliteTransaction {
         }
     }
 
-    // ! TRACING INTEGRATED
     fn exists_table(&self, tname: &str) -> Result<bool, OperationError> {
         let mut stmt = self
             .get_conn()
@@ -209,13 +206,11 @@ pub trait IdlSqliteTransaction {
         }
     }
 
-    // ! TRACING INTEGRATED
     fn exists_idx(&self, attr: &str, itype: &IndexType) -> Result<bool, OperationError> {
         let tname = format!("idx_{}_{}", itype.as_idx_str(), attr);
         self.exists_table(&tname)
     }
 
-    // ! TRACING INTEGRATED
     fn get_idl(
         &self,
         attr: &str,
@@ -256,7 +251,6 @@ pub trait IdlSqliteTransaction {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn name2uuid(&mut self, name: &str) -> Result<Option<Uuid>, OperationError> {
         spanned!("be::idl_sqlite::name2uuid", {
             // The table exists - lets now get the actual index itself.
@@ -277,7 +271,6 @@ pub trait IdlSqliteTransaction {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn uuid2spn(&mut self, uuid: &Uuid) -> Result<Option<Value>, OperationError> {
         spanned!("be::idl_sqlite::uuid2spn", {
             let uuids = uuid.to_hyphenated_ref().to_string();
@@ -295,9 +288,10 @@ pub trait IdlSqliteTransaction {
             let spn: Option<Value> = match spn_raw {
                 Some(d) => {
                     let dbv = serde_cbor::from_slice(d.as_slice()).map_err(serde_cbor_error)?;
-                    let spn = Value::from_db_valuev1(dbv)
-                        .map_err(|_| OperationError::CorruptedIndex("uuid2spn".to_string()))?;
-                    Some(spn)
+
+                    ValueSet::from_db_valuev1_iter(std::iter::once(dbv))
+                        .map_err(|_| OperationError::CorruptedIndex("uuid2spn".to_string()))
+                        .map(|vs| vs.to_value_single())?
                 }
                 None => None,
             };
@@ -308,7 +302,6 @@ pub trait IdlSqliteTransaction {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn uuid2rdn(&mut self, uuid: &Uuid) -> Result<Option<String>, OperationError> {
         spanned!("be::idl_sqlite::uuid2rdn", {
             let uuids = uuid.to_hyphenated_ref().to_string();
@@ -329,7 +322,6 @@ pub trait IdlSqliteTransaction {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn get_db_s_uuid(&self) -> Result<Option<Uuid>, OperationError> {
         // Try to get a value.
         let data: Option<Vec<u8>> = self
@@ -357,7 +349,6 @@ pub trait IdlSqliteTransaction {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn get_db_d_uuid(&self) -> Result<Option<Uuid>, OperationError> {
         // Try to get a value.
         let data: Option<Vec<u8>> = self
@@ -385,7 +376,6 @@ pub trait IdlSqliteTransaction {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn get_allids(&self) -> Result<IDLBitRange, OperationError> {
         trace!("Building allids...");
         let mut stmt = self
@@ -410,7 +400,6 @@ pub trait IdlSqliteTransaction {
         ids
     }
 
-    // ! TRACING INTEGRATED
     fn list_idxs(&self) -> Result<Vec<String>, OperationError> {
         let mut stmt = self
             .get_conn()
@@ -421,7 +410,6 @@ pub trait IdlSqliteTransaction {
         idx_table_iter.map(|v| v.map_err(sqlite_error)).collect()
     }
 
-    // ! TRACING INTEGRATED
     fn list_id2entry(&self) -> Result<Vec<(u64, String)>, OperationError> {
         let allids = self.get_identry_raw(&IdList::AllIds)?;
         allids
@@ -430,7 +418,6 @@ pub trait IdlSqliteTransaction {
             .collect()
     }
 
-    // ! TRACING INTEGRATED
     fn get_id2entry(&self, id: u64) -> Result<(u64, String), OperationError> {
         let idl = IdList::Indexed(IDLBitRange::from_u64(id));
         let mut allids = self.get_identry_raw(&idl)?;
@@ -443,7 +430,6 @@ pub trait IdlSqliteTransaction {
             })
     }
 
-    // ! TRACING INTEGRATED
     fn list_index_content(
         &self,
         index_name: &str,
@@ -572,7 +558,6 @@ impl IdlSqliteWriteTransaction {
         }
     }
 
-    // ! TRACING INTEGRATED
     pub fn commit(mut self) -> Result<(), OperationError> {
         spanned!("be::idl_sqlite::commit", {
             trace!("Commiting BE WR txn");
@@ -710,7 +695,6 @@ impl IdlSqliteWriteTransaction {
     }
     */
 
-    // ! TRACING INTEGRATED
     pub fn delete_identry(&self, id: u64) -> Result<(), OperationError> {
         let mut stmt = self
             .conn
@@ -733,7 +717,6 @@ impl IdlSqliteWriteTransaction {
         stmt.execute(&[&iid]).map(|_| ()).map_err(sqlite_error)
     }
 
-    // ! TRACING INTEGRATED
     pub fn write_idl(
         &self,
         attr: &str,
@@ -783,7 +766,6 @@ impl IdlSqliteWriteTransaction {
         })
     }
 
-    // ! TRACING INTEGRATED
     pub fn create_name2uuid(&self) -> Result<(), OperationError> {
         self.conn
             .execute(
@@ -794,7 +776,6 @@ impl IdlSqliteWriteTransaction {
             .map_err(sqlite_error)
     }
 
-    // ! TRACING INTEGRATED
     pub fn write_name2uuid_add(&self, name: &str, uuid: &Uuid) -> Result<(), OperationError> {
         let uuids = uuid.to_hyphenated_ref().to_string();
 
@@ -810,7 +791,6 @@ impl IdlSqliteWriteTransaction {
             .map_err(sqlite_error)
     }
 
-    // ! TRACING INTEGRATED
     pub fn write_name2uuid_rem(&self, name: &str) -> Result<(), OperationError> {
         self.conn
             .prepare("DELETE FROM idx_name2uuid WHERE name = :name")
@@ -819,7 +799,6 @@ impl IdlSqliteWriteTransaction {
             .map_err(sqlite_error)
     }
 
-    // ! TRACING INTEGRATED
     pub fn create_uuid2spn(&self) -> Result<(), OperationError> {
         self.conn
             .execute(
@@ -830,12 +809,11 @@ impl IdlSqliteWriteTransaction {
             .map_err(sqlite_error)
     }
 
-    // ! TRACING INTEGRATED
     pub fn write_uuid2spn(&self, uuid: &Uuid, k: Option<&Value>) -> Result<(), OperationError> {
         let uuids = uuid.to_hyphenated_ref().to_string();
         match k {
             Some(k) => {
-                let dbv1 = k.to_db_valuev1();
+                let dbv1 = k.to_supplementary_db_valuev1();
                 let data = serde_cbor::to_vec(&dbv1).map_err(serde_cbor_error)?;
                 self.conn
                     .prepare("INSERT OR REPLACE INTO idx_uuid2spn (uuid, spn) VALUES(:uuid, :spn)")
@@ -857,7 +835,6 @@ impl IdlSqliteWriteTransaction {
         }
     }
 
-    // ! TRACING INTEGRATED
     pub fn create_uuid2rdn(&self) -> Result<(), OperationError> {
         self.conn
             .execute(
@@ -868,7 +845,6 @@ impl IdlSqliteWriteTransaction {
             .map_err(sqlite_error)
     }
 
-    // ! TRACING INTEGRATED
     pub fn write_uuid2rdn(&self, uuid: &Uuid, k: Option<&String>) -> Result<(), OperationError> {
         let uuids = uuid.to_hyphenated_ref().to_string();
         match k {
@@ -887,7 +863,6 @@ impl IdlSqliteWriteTransaction {
         }
     }
 
-    // ! TRACING INTEGRATED
     pub fn create_idx(&self, attr: &str, itype: &IndexType) -> Result<(), OperationError> {
         // Is there a better way than formatting this? I can't seem
         // to template into the str.
@@ -906,7 +881,6 @@ impl IdlSqliteWriteTransaction {
             .map_err(sqlite_error)
     }
 
-    // ! TRACING INTEGRATED
     pub unsafe fn purge_idxs(&self) -> Result<(), OperationError> {
         let idx_table_list = self.list_idxs()?;
 
@@ -919,7 +893,6 @@ impl IdlSqliteWriteTransaction {
         })
     }
 
-    // ! TRACING INTEGRATED
     pub fn store_idx_slope_analysis(
         &self,
         slopes: &HashMap<IdxKey, IdxSlope>,
@@ -960,12 +933,10 @@ impl IdlSqliteWriteTransaction {
         })
     }
 
-    // ! TRACING INTEGRATED
     pub fn is_idx_slopeyness_generated(&self) -> Result<bool, OperationError> {
         self.exists_table("idxslope_analysis")
     }
 
-    // ! TRACING INTEGRATED
     pub fn get_idx_slope(&self, ikey: &IdxKey) -> Result<Option<IdxSlope>, OperationError> {
         let analysis_exists = self.exists_table("idxslope_analysis")?;
         if !analysis_exists {
@@ -991,7 +962,6 @@ impl IdlSqliteWriteTransaction {
         Ok(slope)
     }
 
-    // ! TRACING INTEGRATED
     pub unsafe fn purge_id2entry(&self) -> Result<(), OperationError> {
         trace!("purge id2entry ...");
         self.conn
@@ -1000,7 +970,6 @@ impl IdlSqliteWriteTransaction {
             .map_err(sqlite_error)
     }
 
-    // ! TRACING INTEGRATED
     pub fn write_db_s_uuid(&self, nsid: Uuid) -> Result<(), OperationError> {
         let data = serde_cbor::to_vec(&nsid).map_err(|e| {
             admin_error!(immediate = true, ?e, "CRITICAL: Serde CBOR Error");
@@ -1024,7 +993,6 @@ impl IdlSqliteWriteTransaction {
             })
     }
 
-    // ! TRACING INTEGRATED
     pub fn write_db_d_uuid(&self, nsid: Uuid) -> Result<(), OperationError> {
         let data = serde_cbor::to_vec(&nsid).map_err(|e| {
             admin_error!(immediate = true, ?e, "CRITICAL: Serde CBOR Error");
@@ -1071,7 +1039,6 @@ impl IdlSqliteWriteTransaction {
             })
     }
 
-    // ! TRACING INTEGRATED
     pub fn get_db_ts_max(&self) -> Result<Option<Duration>, OperationError> {
         // Try to get a value.
         let data: Option<Vec<u8>> = self
@@ -1132,7 +1099,6 @@ impl IdlSqliteWriteTransaction {
         self.get_db_version_key(DBV_INDEXV)
     }
 
-    // ! TRACING INTEGRATED
     pub(crate) fn set_db_index_version(&self, v: i64) -> Result<(), OperationError> {
         self.set_db_version_key(DBV_INDEXV, v).map_err(|e| {
             admin_error!(immediate = true, ?e, "CRITICAL: rusqlite error");
@@ -1141,7 +1107,6 @@ impl IdlSqliteWriteTransaction {
         })
     }
 
-    // ! TRACING INTEGRATED
     pub fn setup(&self) -> Result<(), OperationError> {
         // This stores versions of components. For example:
         // ----------------------
@@ -1251,7 +1216,6 @@ impl IdlSqliteWriteTransaction {
 }
 
 impl IdlSqlite {
-    // ! TRACING INTEGRATED
     pub fn new(cfg: &BackendConfig, vacuum: bool) -> Result<Self, OperationError> {
         if cfg.path.is_empty() {
             debug_assert!(cfg.pool_size == 1);
@@ -1360,7 +1324,6 @@ impl IdlSqlite {
         Ok(IdlSqlite { pool })
     }
 
-    // ! TRACING INTEGRATED
     pub(crate) fn get_allids_count(&self) -> Result<u64, OperationError> {
         trace!("Counting allids...");
         #[allow(clippy::expect_used)]

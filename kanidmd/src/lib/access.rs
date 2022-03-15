@@ -15,7 +15,7 @@
 //!
 
 // use concread::collections::bptree::*;
-use concread::arcache::{ARCache, ARCacheReadTxn};
+use concread::arcache::{ARCache, ARCacheBuilder, ARCacheReadTxn};
 use concread::cowcell::*;
 use kanidm_proto::v1::Filter as ProtoFilter;
 use kanidm_proto::v1::OperationError;
@@ -287,6 +287,9 @@ impl AccessControlModify {
 #[derive(Debug, Clone)]
 struct AccessControlProfile {
     name: String,
+    // Currently we retrieve this but don't use it. We could depending on how we change
+    // the acp update routine.
+    #[allow(dead_code)]
     uuid: Uuid,
     receiver: Filter<FilterValid>,
     targetscope: Filter<FilterValid>,
@@ -394,7 +397,6 @@ pub trait AccessControlsTransaction<'a> {
         &self,
     ) -> &mut ARCacheReadTxn<'a, (IdentityId, Filter<FilterValid>), Filter<FilterValidResolved>>;
 
-    // ! TRACING INTEGRATED
     fn search_related_acp<'b>(
         &'b self,
         rec_entry: &Entry<EntrySealed, EntryCommitted>,
@@ -581,7 +583,6 @@ pub trait AccessControlsTransaction<'a> {
         })
     }
 
-    // ! TRACING INTEGRATED
     fn search_filter_entry_attributes(
         &self,
         se: &SearchEvent,
@@ -1324,11 +1325,16 @@ impl AccessControls {
                 ACP_RELATED_SEARCH_CACHE_LOCAL,
             ),
             */
-            acp_resolve_filter_cache: ARCache::new_size(
-                ACP_RESOLVE_FILTER_CACHE_MAX,
-                ACP_RESOLVE_FILTER_CACHE_LOCAL,
-            ),
+            acp_resolve_filter_cache: ARCacheBuilder::new()
+                .set_size(ACP_RESOLVE_FILTER_CACHE_MAX, ACP_RESOLVE_FILTER_CACHE_LOCAL)
+                .set_reader_quiesce(true)
+                .build()
+                .expect("Failed to construct acp_resolve_filter_cache"),
         }
+    }
+
+    pub fn try_quiesce(&self) {
+        self.acp_resolve_filter_cache.try_quiesce();
     }
 
     pub fn read(&self) -> AccessControlsReadTransaction {

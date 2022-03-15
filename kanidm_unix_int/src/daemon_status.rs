@@ -1,5 +1,7 @@
 #![deny(warnings)]
 #![warn(unused_extern_crates)]
+#![deny(clippy::todo)]
+#![deny(clippy::unimplemented)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
@@ -9,9 +11,8 @@
 #![deny(clippy::trivially_copy_pass_by_ref)]
 
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
-use log::debug;
 use std::path::PathBuf;
 use structopt::StructOpt;
 
@@ -27,12 +28,10 @@ fn main() {
     let opt = UnixdStatusOpt::from_args();
     if opt.debug {
         ::std::env::set_var("RUST_LOG", "kanidm=debug,kanidm_client=debug");
-    } else {
-        ::std::env::set_var("RUST_LOG", "kanidm=info,kanidm_client=info");
     }
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
-    debug!("Starting cache status tool ...");
+    trace!("Starting cache status tool ...");
 
     let cfg = match KanidmUnixdConfig::new().read_options_from_optional_config("/etc/kanidm/unixd")
     {
@@ -54,7 +53,7 @@ fn main() {
     } else {
         match call_daemon_blocking(cfg.sock_path.as_str(), &req) {
             Ok(r) => match r {
-                ClientResponse::Ok => info!("working!"),
+                ClientResponse::Ok => println!("working!"),
                 _ => {
                     error!("Error: unexpected response -> {:?}", r);
                 }

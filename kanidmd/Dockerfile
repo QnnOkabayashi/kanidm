@@ -3,13 +3,13 @@ FROM ${BASE_IMAGE} AS builder
 LABEL mantainer william@blackhats.net.au
 
 RUN zypper ar obs://devel:languages:rust devel:languages:rust && \
+    sed -i -E 's/https?:\/\/download.opensuse.org/https:\/\/mirrorcache.firstyear.id.au/g' /etc/zypp/repos.d/*.repo && \
     zypper --gpg-auto-import-keys ref --force && \
     zypper dup -y && \
     zypper install -y \
         cargo \
         rust \
-        gcc \
-        clang lld \
+        gcc clang lld \
         make automake autoconf \
         libopenssl-devel pam-devel \
         sqlite3-devel \
@@ -17,7 +17,7 @@ RUN zypper ar obs://devel:languages:rust devel:languages:rust && \
     zypper clean -a
 
 COPY . /usr/src/kanidm
-WORKDIR /usr/src/kanidm/kanidmd
+WORKDIR /usr/src/kanidm/kanidmd/daemon
 
 ARG SCCACHE_REDIS
 ARG KANIDM_FEATURES

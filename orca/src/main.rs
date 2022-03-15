@@ -13,10 +13,7 @@
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 #[macro_use]
-extern crate log;
-
-#[macro_use]
-extern crate serde_derive;
+extern crate tracing;
 
 use crate::ds::DirectoryServer;
 use crate::kani::{KaniHttpServer, KaniLdapServer};
@@ -187,10 +184,8 @@ async fn main() {
             "RUST_LOG",
             "orca=debug,kanidm=debug,kanidm_client=debug,webauthn=debug",
         );
-    } else {
-        ::std::env::set_var("RUST_LOG", "orca=info");
     }
-    env_logger::init();
+    tracing_subscriber::fmt::init();
 
     info!("Orca - the Kanidm Load Testing Utility.");
     debug!("cli -> {:?}", opt);

@@ -1,5 +1,7 @@
 #![deny(warnings)]
 #![warn(unused_extern_crates)]
+#![deny(clippy::todo)]
+#![deny(clippy::unimplemented)]
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
@@ -9,9 +11,9 @@
 #![deny(clippy::trivially_copy_pass_by_ref)]
 
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
-use serde_derive::Deserialize;
+use serde::Deserialize;
 use serde_json::error::Error as SerdeJsonError;
 use std::collections::BTreeSet as Set;
 use std::fs::{metadata, File, Metadata};
@@ -810,6 +812,16 @@ impl KanidmClient {
         tokio_block_on(self.asclient.idm_account_unix_cred_verify(id, cred))
     }
 
+    /*
+    pub fn idm_account_orgperson_extend(
+        &self,
+        id: &str,
+        mail: &str,
+    ) -> Result<(), ClientError> {
+        tokio_block_on(self.asclient.idm_account_orgperson_extend(id, mail))
+    }
+    */
+
     pub fn idm_account_get_ssh_pubkeys(&self, id: &str) -> Result<Vec<String>, ClientError> {
         tokio_block_on(self.asclient.idm_account_get_ssh_pubkeys(id))
     }
@@ -823,8 +835,13 @@ impl KanidmClient {
         tokio_block_on(self.asclient.idm_account_post_ssh_pubkey(id, tag, pubkey))
     }
 
-    pub fn idm_account_person_extend(&self, id: &str) -> Result<(), ClientError> {
-        tokio_block_on(self.asclient.idm_account_person_extend(id))
+    pub fn idm_account_person_extend(
+        &self,
+        id: &str,
+        mail: Option<&[String]>,
+        legalname: Option<&str>,
+    ) -> Result<(), ClientError> {
+        tokio_block_on(self.asclient.idm_account_person_extend(id, mail, legalname))
     }
 
     /*
@@ -907,6 +924,7 @@ impl KanidmClient {
         tokio_block_on(self.asclient.idm_oauth2_rs_get(id))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn idm_oauth2_rs_update(
         &self,
         id: &str,
@@ -916,6 +934,7 @@ impl KanidmClient {
         scopes: Option<Vec<&str>>,
         reset_secret: bool,
         reset_token_key: bool,
+        reset_sign_key: bool,
     ) -> Result<(), ClientError> {
         tokio_block_on(self.asclient.idm_oauth2_rs_update(
             id,
@@ -925,6 +944,7 @@ impl KanidmClient {
             scopes,
             reset_secret,
             reset_token_key,
+            reset_sign_key,
         ))
     }
 
@@ -946,6 +966,22 @@ impl KanidmClient {
 
     pub fn idm_oauth2_rs_delete(&self, id: &str) -> Result<(), ClientError> {
         tokio_block_on(self.asclient.idm_oauth2_rs_delete(id))
+    }
+
+    pub fn idm_oauth2_rs_enable_pkce(&self, id: &str) -> Result<(), ClientError> {
+        tokio_block_on(self.asclient.idm_oauth2_rs_enable_pkce(id))
+    }
+
+    pub fn idm_oauth2_rs_disable_pkce(&self, id: &str) -> Result<(), ClientError> {
+        tokio_block_on(self.asclient.idm_oauth2_rs_disable_pkce(id))
+    }
+
+    pub fn idm_oauth2_rs_enable_legacy_crypto(&self, id: &str) -> Result<(), ClientError> {
+        tokio_block_on(self.asclient.idm_oauth2_rs_enable_legacy_crypto(id))
+    }
+
+    pub fn idm_oauth2_rs_disable_legacy_crypto(&self, id: &str) -> Result<(), ClientError> {
+        tokio_block_on(self.asclient.idm_oauth2_rs_disable_legacy_crypto(id))
     }
 
     // ==== recycle bin

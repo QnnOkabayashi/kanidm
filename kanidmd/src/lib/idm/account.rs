@@ -52,15 +52,16 @@ macro_rules! try_from_entry {
             .get_ava_single_credential("primary_credential")
             .map(|v| v.clone());
 
-        let spn = $value
-            .get_ava_single("spn")
-            .map(|s| {
-                debug_assert!(s.is_spn());
-                s.to_proto_string_clone()
-            })
-            .ok_or(OperationError::InvalidAccountState(
-                "Missing attribute: spn".to_string(),
-            ))?;
+        let spn = $value.get_ava_single_proto_string("spn").ok_or(
+            OperationError::InvalidAccountState("Missing attribute: spn".to_string()),
+        )?;
+
+        let mail_primary = $value.get_ava_mail_primary("mail").map(str::to_string);
+
+        let mail = $value
+            .get_ava_iter_mail("mail")
+            .map(|i| i.map(str::to_string).collect())
+            .unwrap_or_else(Vec::new);
 
         let valid_from = $value.get_ava_single_datetime("account_valid_from");
 
@@ -85,6 +86,8 @@ macro_rules! try_from_entry {
             expire,
             radius_secret,
             spn,
+            mail_primary,
+            mail,
         })
     }};
 }
@@ -100,6 +103,8 @@ pub(crate) struct Account {
     pub name: String,
     pub displayname: String,
     pub uuid: Uuid,
+    // We want to allow this so that in the future we can populate this into oauth2 tokens
+    #[allow(dead_code)]
     pub groups: Vec<Group>,
     pub primary: Option<Credential>,
     pub valid_from: Option<OffsetDateTime>,
@@ -111,11 +116,11 @@ pub(crate) struct Account {
     pub spn: String,
     // TODO #256: When you add mail, you should update the check to zxcvbn
     // to include these.
-    // pub mail: Vec<String>
+    pub mail_primary: Option<String>,
+    pub mail: Vec<String>,
 }
 
 impl Account {
-    // ! TRACING INTEGRATED
     pub(crate) fn try_from_entry_ro(
         value: &Entry<EntrySealed, EntryCommitted>,
         qs: &mut QueryServerReadTransaction,
@@ -126,7 +131,6 @@ impl Account {
         })
     }
 
-    // ! TRACING INTEGRATED
     pub(crate) fn try_from_entry_rw(
         value: &Entry<EntrySealed, EntryCommitted>,
         qs: &mut QueryServerWriteTransaction,
@@ -137,7 +141,6 @@ impl Account {
         })
     }
 
-    // ! TRACING INTEGRATED
     pub(crate) fn try_from_entry_reduced(
         value: &Entry<EntryReduced, EntryCommitted>,
         qs: &mut QueryServerReadTransaction,
@@ -148,7 +151,6 @@ impl Account {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn try_from_entry_no_groups(
         value: &Entry<EntrySealed, EntryCommitted>,
     ) -> Result<Self, OperationError> {
@@ -175,16 +177,15 @@ impl Account {
 
         Some(UserAuthToken {
             session_id,
+            auth_type,
             expiry,
-            // name: self.name.clone(),
-            spn: self.spn.clone(),
-            // displayname: self.displayname.clone(),
             uuid: self.uuid,
+            // name: self.name.clone(),
+            displayname: self.displayname.clone(),
+            spn: self.spn.clone(),
+            mail_primary: self.mail_primary.clone(),
             // application: None,
             // groups: self.groups.iter().map(|g| g.to_proto()).collect(),
-            // claims: claims.iter().map(|c| c.to_proto()).collect(),
-            // claims: Vec::new(),
-            auth_type,
             // What's the best way to get access to these limits with regard to claims/other?
             lim_uidx: false,
             lim_rmax: 128,
@@ -222,17 +223,42 @@ impl Account {
         Self::check_within_valid_time(ct, self.valid_from.as_ref(), self.expire.as_ref())
     }
 
-    pub fn primary_cred_uuid(&self) -> Uuid {
-        match &self.primary {
-            Some(cred) => cred.uuid,
-            None => UUID_ANONYMOUS,
+    // Get related inputs, such as account name, email, etc.
+    pub fn related_inputs(&self) -> Vec<&str> {
+        let mut inputs = Vec::with_capacity(4 + self.mail.len());
+        self.mail.iter().for_each(|m| {
+            inputs.push(m.as_str());
+        });
+        inputs.push(self.name.as_str());
+        inputs.push(self.spn.as_str());
+        inputs.push(self.displayname.as_str());
+        if let Some(s) = self.radius_secret.as_deref() {
+            inputs.push(s);
         }
+        inputs
     }
 
-    pub fn primary_cred_softlock_policy(&self) -> Option<CredSoftLockPolicy> {
+    pub fn primary_cred_uuid(&self) -> Option<Uuid> {
+        self.primary.as_ref().map(|cred| cred.uuid).or_else(|| {
+            if self.is_anonymous() {
+                Some(UUID_ANONYMOUS)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn primary_cred_uuid_and_policy(&self) -> Option<(Uuid, CredSoftLockPolicy)> {
         self.primary
             .as_ref()
-            .and_then(|cred| cred.softlock_policy())
+            .map(|cred| (cred.uuid, cred.softlock_policy()))
+            .or_else(|| {
+                if self.is_anonymous() {
+                    Some((UUID_ANONYMOUS, CredSoftLockPolicy::Unrestricted))
+                } else {
+                    None
+                }
+            })
     }
 
     pub fn is_anonymous(&self) -> bool {

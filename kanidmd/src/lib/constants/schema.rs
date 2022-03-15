@@ -274,6 +274,7 @@ pub const JSON_SCHEMA_ATTR_DOMAIN_SSID: &str = r#"{
       ]
     }
 }"#;
+
 pub const JSON_SCHEMA_ATTR_DOMAIN_TOKEN_KEY: &str = r#"{
     "attrs": {
       "class": [
@@ -282,7 +283,7 @@ pub const JSON_SCHEMA_ATTR_DOMAIN_TOKEN_KEY: &str = r#"{
         "attributetype"
       ],
       "description": [
-        "The domains token signing key, which is shared between IDM servers."
+        "The domain token encryption private key (NOT USED)."
       ],
       "index": [],
       "unique": [
@@ -299,6 +300,35 @@ pub const JSON_SCHEMA_ATTR_DOMAIN_TOKEN_KEY: &str = r#"{
       ],
       "uuid": [
         "00000000-0000-0000-0000-ffff00000088"
+      ]
+    }
+}"#;
+
+pub const JSON_SCHEMA_ATTR_FERNET_PRIVATE_KEY_STR: &str = r#"{
+    "attrs": {
+      "class": [
+        "object",
+        "system",
+        "attributetype"
+      ],
+      "description": [
+        "The token encryption private key."
+      ],
+      "index": [],
+      "unique": [
+        "false"
+      ],
+      "multivalue": [
+        "false"
+      ],
+      "attributename": [
+        "fernet_private_key_str"
+      ],
+      "syntax": [
+        "SECRET_UTF8STRING"
+      ],
+      "uuid": [
+        "00000000-0000-0000-0000-ffff00000095"
       ]
     }
 }"#;
@@ -690,6 +720,122 @@ pub const JSON_SCHEMA_ATTR_OAUTH2_RS_IMPLICIT_SCOPES: &str = r#"{
     }
 }"#;
 
+pub const JSON_SCHEMA_ATTR_ES256_PRIVATE_KEY_DER: &str = r#"{
+    "attrs": {
+      "class": [
+        "object",
+        "system",
+        "attributetype"
+      ],
+      "description": [
+        "An es256 private key"
+      ],
+      "index": [],
+      "unique": [
+        "false"
+      ],
+      "multivalue": [
+        "false"
+      ],
+      "attributename": [
+        "es256_private_key_der"
+      ],
+      "syntax": [
+        "PRIVATE_BINARY"
+      ],
+      "uuid": [
+        "00000000-0000-0000-0000-ffff00000090"
+      ]
+    }
+}"#;
+
+pub const JSON_SCHEMA_ATTR_RS256_PRIVATE_KEY_DER: &str = r#"{
+    "attrs": {
+      "class": [
+        "object",
+        "system",
+        "attributetype"
+      ],
+      "description": [
+        "An rs256 private key"
+      ],
+      "index": [],
+      "unique": [
+        "false"
+      ],
+      "multivalue": [
+        "false"
+      ],
+      "attributename": [
+        "rs256_private_key_der"
+      ],
+      "syntax": [
+        "PRIVATE_BINARY"
+      ],
+      "uuid": [
+        "00000000-0000-0000-0000-ffff00000093"
+      ]
+    }
+}"#;
+
+pub const JSON_SCHEMA_ATTR_OAUTH2_ALLOW_INSECURE_CLIENT_DISABLE_PKCE: &str = r#"{
+    "attrs": {
+      "class": [
+        "object",
+        "system",
+        "attributetype"
+      ],
+      "description": [
+        "Allows disabling of pkce for insecure oauth2 clients"
+      ],
+      "index": [],
+      "unique": [
+        "false"
+      ],
+      "multivalue": [
+        "false"
+      ],
+      "attributename": [
+        "oauth2_allow_insecure_client_disable_pkce"
+      ],
+      "syntax": [
+        "BOOLEAN"
+      ],
+      "uuid": [
+        "00000000-0000-0000-0000-ffff00000091"
+      ]
+    }
+}"#;
+
+pub const JSON_SCHEMA_ATTR_OAUTH2_JWT_LEGACY_CRYPTO_ENABLE: &str = r#"{
+    "attrs": {
+      "class": [
+        "object",
+        "system",
+        "attributetype"
+      ],
+      "description": [
+        "Allows enabling legacy jwt cryptograhpy for clients"
+      ],
+      "index": [],
+      "unique": [
+        "false"
+      ],
+      "multivalue": [
+        "false"
+      ],
+      "attributename": [
+        "oauth2_jwt_legacy_crypto_enable"
+      ],
+      "syntax": [
+        "BOOLEAN"
+      ],
+      "uuid": [
+        "00000000-0000-0000-0000-ffff00000092"
+      ]
+    }
+}"#;
+
 // === classes ===
 
 pub const JSON_SCHEMA_CLASS_PERSON: &str = r#"
@@ -716,6 +862,35 @@ pub const JSON_SCHEMA_CLASS_PERSON: &str = r#"
       ],
       "uuid": [
         "00000000-0000-0000-0000-ffff00000044"
+      ]
+    }
+  }
+"#;
+
+pub const JSON_SCHEMA_CLASS_ORGPERSON: &str = r#"
+  {
+    "attrs": {
+      "class": [
+        "object",
+        "system",
+        "classtype"
+      ],
+      "description": [
+        "Object representation of an org person"
+      ],
+      "classname": [
+        "orgperson"
+      ],
+      "systemmay": [
+        "legalname"
+      ],
+      "systemmust": [
+        "mail",
+        "displayname",
+        "name"
+      ],
+      "uuid": [
+        "00000000-0000-0000-0000-ffff00000094"
       ]
     }
   }
@@ -808,7 +983,8 @@ pub const JSON_SCHEMA_CLASS_DOMAIN_INFO: &str = r#"
         "name",
         "domain_uuid",
         "domain_name",
-        "domain_token_key"
+        "fernet_private_key_str",
+        "es256_private_key_der"
       ],
       "uuid": [
         "00000000-0000-0000-0000-ffff00000052"
@@ -911,13 +1087,17 @@ pub const JSON_SCHEMA_CLASS_OAUTH2_RS: &str = r#"
       "systemmay": [
         "description",
         "oauth2_rs_scope_map",
-        "oauth2_rs_implicit_scopes"
+        "oauth2_rs_implicit_scopes",
+        "oauth2_allow_insecure_client_disable_pkce",
+        "rs256_private_key_der",
+        "oauth2_jwt_legacy_crypto_enable"
       ],
       "systemmust": [
         "oauth2_rs_name",
         "displayname",
         "oauth2_rs_origin",
-        "oauth2_rs_token_key"
+        "oauth2_rs_token_key",
+        "es256_private_key_der"
       ],
       "uuid": [
         "00000000-0000-0000-0000-ffff00000085"

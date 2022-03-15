@@ -36,15 +36,6 @@ struct RecoverAccountOpt {
 }
 
 #[derive(Debug, StructOpt)]
-struct DomainOpt {
-    #[structopt(short)]
-    /// The new domain name.
-    new_domain_name: String,
-    #[structopt(flatten)]
-    commonopts: CommonOpt,
-}
-
-#[derive(Debug, StructOpt)]
 struct DbScanListIndex {
     /// The name of the index to list
     index_name: String,
@@ -52,6 +43,7 @@ struct DbScanListIndex {
     commonopts: CommonOpt,
 }
 
+/*
 #[derive(Debug, StructOpt)]
 struct DbScanGetIndex {
     /// The name of the index to list
@@ -61,6 +53,7 @@ struct DbScanGetIndex {
     #[structopt(flatten)]
     commonopts: CommonOpt,
 }
+*/
 
 #[derive(Debug, StructOpt)]
 struct DbScanGetId2Entry {
@@ -97,6 +90,9 @@ enum KanidmdOpt {
     #[structopt(name = "server")]
     /// Start the IDM Server
     Server(CommonOpt),
+    #[structopt(name = "configtest")]
+    /// Test the IDM Server configuration, without starting network listeners.
+    ConfigTest(CommonOpt),
     #[structopt(name = "backup")]
     /// Backup the database content (offline)
     Backup(BackupOpt),
@@ -119,7 +115,7 @@ enum KanidmdOpt {
     Vacuum(CommonOpt),
     #[structopt(name = "domain_name_change")]
     /// Change the IDM domain name
-    DomainChange(DomainOpt),
+    DomainChange(CommonOpt),
     #[structopt(name = "db_scan")]
     /// Inspect the internal content of the database datastructures.
     DbScan(DbScanOpt),

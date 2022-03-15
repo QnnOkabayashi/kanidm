@@ -4,8 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use kanidm::audit::LogLevel;
-use kanidm::config::{Configuration, IntegrationTestConfig};
-use kanidm::core::create_server_core;
+use kanidm::config::{Configuration, IntegrationTestConfig, ServerRole};
+use score::create_server_core;
 
 use kanidm::tracing_tree;
 use kanidm_unix_common::cache::{CacheLayer, Id};
@@ -37,9 +37,7 @@ fn is_free_port(port: u16) -> bool {
 }
 
 fn run_test(fix_fn: fn(&KanidmClient) -> (), test_fn: fn(CacheLayer, KanidmAsyncClient) -> ()) {
-    // ::std::env::set_var("RUST_LOG", "kanidm=debug");
     let _ = tracing_tree::test_init();
-    let _ = env_logger::builder().is_test(true).try_init();
 
     let (ready_tx, mut ready_rx) = mpsc::channel(1);
     let (finish_tx, mut finish_rx) = mpsc::channel(1);
@@ -68,6 +66,7 @@ fn run_test(fix_fn: fn(&KanidmClient) -> (), test_fn: fn(CacheLayer, KanidmAsync
     config.secure_cookies = false;
     config.integration_test_config = Some(int_config);
     config.log_level = Some(LogLevel::Quiet as u32);
+    config.role = ServerRole::WriteReplicaNoUI;
     // config.log_level = Some(LogLevel::Verbose as u32);
     config.threads = 1;
 
@@ -79,7 +78,7 @@ fn run_test(fix_fn: fn(&KanidmClient) -> (), test_fn: fn(CacheLayer, KanidmAsync
             .build()
             .expect("failed to start tokio");
         rt.block_on(async {
-            create_server_core(config)
+            create_server_core(config, false)
                 .await
                 .expect("failed to start server core");
             // We have to yield now to guarantee that the tide elements are setup.
